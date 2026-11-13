@@ -21,6 +21,11 @@ except ImportError:
 from fsspec.asyn import AsyncFileSystem
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.core import filesystem, open, split_protocol
+from fsspec.implementations._reference_materialize import (
+    ReferenceMaterializationError,
+    materialize as _materialize_impl,
+    materialize_sync,
+)
 from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
 from fsspec.utils import (
     isfilelike,
@@ -39,6 +44,15 @@ class ReferenceNotReachable(RuntimeError):
 
     def __str__(self):
         return f'Reference "{self.reference}" failed to fetch target {self.target}'
+
+
+__all__ = [
+    "LazyReferenceMapper",
+    "ReferenceFileSystem",
+    "ReferenceFile",
+    "ReferenceMaterializationError",
+    "ReferenceNotReachable",
+]
 
 
 def _first(d):
@@ -881,6 +895,133 @@ class ReferenceFileSystem(AsyncFileSystem):
         for remote, local in zip(rpath, targets):
             if remote in data:
                 fs.pipe_file(local, data[remote])
+
+    def materialize(
+        self,
+        paths,
+        destination,
+        *,
+        checkpoint,
+        expected_sha256=None,
+        block_size=1048576,
+        max_concurrency=4,
+        resume=False,
+    ):
+        """Materialize selected logical reference keys into local files.
+
+        This is an independent, resumable, bounded-concurrency alternative to
+        :meth:`get` / :meth:`cat`: it streams each selected logical file to a
+        local file in fixed-size chunks instead of collecting whole files (or
+        the whole selection) into memory, and records progress in a JSON
+        checkpoint so that interrupted runs can be resumed.  The default
+        behavior of ``get``, ``cat`` and ``open`` is unchanged.
+
+        Parameters
+        ----------
+        paths : str or sequence of str
+            One logical key, or a sequence of logical keys.  Order is
+            preserved in the returned lists.  Duplicate keys, absolute paths,
+            ``..``/``.`` segments, empty segments, backslashes and file/
+            directory prefix conflicts (e.g. ``a`` and ``a/b``) are rejected.
+            No glob expansion or recursive expansion is performed.
+        destination : str
+            Local output root directory; selected keys are written below it
+            using their logical relative paths.  Unrelated files inside it are
+            left untouched.
+        checkpoint : str
+            Local path of the persistent JSON progress file.  Must not
+            coincide with any selected target file.
+        expected_sha256 : dict or None
+            If given, must map every selected key to a 64-character hex
+            digest (case-insensitive); digests are normalized to lower case
+            for comparison and for the plan fingerprint.
+        block_size : int
+            Maximum byte length of a single remote payload request (default
+            1 MiB).  Must be a positive ``int``; ``bool`` is rejected.
+        max_concurrency : int
+            Maximum number of concurrently active remote payload reads
+            (default 4).  Must be a positive ``int``; ``bool`` is rejected.
+            Additional remote payload resident in memory is bounded by
+            ``O(max_concurrency * block_size)``.
+        resume : bool
+            When ``False`` (default), an existing checkpoint or any selected
+            target file is rejected and a fresh plan is persisted before any
+            payload work starts.  When ``True``, the checkpoint must exist;
+            its frozen plan (references, destination root, expected digests)
+            must match the current call exactly, while ``block_size``,
+            ``max_concurrency`` and the ordering of ``paths`` may differ.
+            Completed files are re-verified by streaming their actual bytes
+            (length and SHA256) before being counted as reused.
+
+        Returns
+        -------
+        dict
+            ``{"written": [...], "reused": [...], "bytes_written": int,
+            "checkpoint": abs_path}`` where both key lists follow this call's
+            input order, ``bytes_written`` counts payload bytes actually
+            written to local disk during this call (reused files contribute
+            zero), and ``checkpoint`` is the absolute checkpoint path.
+
+        Raises
+        ------
+        ReferenceMaterializationError
+            A per-key read/write/verify/rename failure, with ``path`` set to
+            the offending logical key, or a global plan/checkpoint validation
+            failure with ``path=None``.  The original reason is retained via
+            exception chaining.
+        ValueError / TypeError
+            Invalid global parameters, paths or checkpoint contents.
+        asyncio.CancelledError
+            Propagated unchanged when the call is cancelled; all workers
+            created by this call are awaited before it propagates.
+
+        Notes
+        -----
+        The fingerprint freezes the *reference plan* (resolved inline content,
+        URLs, offsets, sizes, default target), the destination root and the
+        expected digests.  It does not freeze the contents served by a remote
+        URL: without ``expected_sha256``, remote content changing between runs
+        is not detected.  Synchronous (blocking) backends run their work in
+        worker threads via
+        :class:`~fsspec.implementations.asyn_wrapper.AsyncFileSystemWrapper`;
+        cancellation cannot interrupt an in-flight blocking call, but the
+        method waits for the already-issued blocking work to finish before
+        returning.  See ``docs/source/reference_materialize.rst`` for the full
+        progress and recovery contract.
+        """
+        return materialize_sync(
+            self,
+            paths,
+            destination,
+            checkpoint=checkpoint,
+            expected_sha256=expected_sha256,
+            block_size=block_size,
+            max_concurrency=max_concurrency,
+            resume=resume,
+        )
+
+    async def _materialize(
+        self,
+        paths,
+        destination,
+        *,
+        checkpoint,
+        expected_sha256=None,
+        block_size=1048576,
+        max_concurrency=4,
+        resume=False,
+    ):
+        """Async counterpart of :meth:`materialize`; directly awaitable."""
+        return await _materialize_impl(
+            self,
+            paths,
+            destination,
+            checkpoint=checkpoint,
+            expected_sha256=expected_sha256,
+            block_size=block_size,
+            max_concurrency=max_concurrency,
+            resume=resume,
+        )
 
     def cat(self, path, recursive=False, on_error="raise", **kwargs):
         if isinstance(path, str) and recursive:

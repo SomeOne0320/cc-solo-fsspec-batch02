@@ -127,6 +127,7 @@ Built-in Implementations
    implementations.memory.MemoryFileSystem
    implementations.reference.ReferenceFileSystem
    implementations.reference.LazyReferenceMapper
+   implementations.reference.ReferenceMaterializationError
    implementations.sftp.SFTPFileSystem
    implementations.smb.SMBFileSystem
    implementations.tar.TarFileSystem
@@ -192,6 +193,9 @@ Built-in Implementations
 
 .. autoclass:: fsspec.implementations.reference.LazyReferenceMapper
    :members: __init__
+
+.. autoclass:: fsspec.implementations.reference.ReferenceMaterializationError
+   :members:
 
 .. autoclass:: fsspec.implementations.sftp.SFTPFileSystem
    :members: __init__
