@@ -1,4 +1,5 @@
 import base64
+import bisect
 import collections
 import io
 import itertools
@@ -694,7 +695,29 @@ class ReferenceFileSystem(AsyncFileSystem):
         self.simple_templates = simple_templates
         self.templates = {}
         self.fss = {}
-        self._dircache = {}
+        # Directory index for in-memory references, built on first listing and
+        # then maintained incrementally by writes/deletes. ``_dirs`` maps a
+        # directory path to an ordered mapping of (kind, name) -> info entry;
+        # ``_dir_names`` holds that directory's child names in sorted order
+        # for prefix lookups; ``_files`` maps a file path to its info entry.
+        # All are empty until a listing needs them, so a single ``info`` call
+        # does not pay for indexing. Lazy (parquet) references keep working
+        # from their own on-demand partitions, with at most a listing cache
+        # dropped on writes.
+        self._dirs = None
+        self._files = {}
+        self._dir_names = {}
+        # Counting hooks, useful for regression tests: how much work the
+        # listing index has done, so repeated scans can be detected.
+        self._dir_stats = {
+            "builds": 0,
+            "keys_indexed": 0,
+            "lookups": 0,
+            "file_updates": 0,
+            "file_removals": 0,
+            "dir_entries_created": 0,
+            "dir_entries_removed": 0,
+        }
         self.max_gap = max_gap
         self.max_block = max_block
         if isinstance(fo, str):
@@ -847,6 +870,7 @@ class ReferenceFileSystem(AsyncFileSystem):
     def pipe_file(self, path, value, **_):
         """Temporarily add binary data or reference as a file"""
         self.references[path] = value
+        self._index_after_write(path)
 
     async def _get_file(self, rpath, lpath, **kwargs):
         if self.isdir(rpath):
@@ -1086,16 +1110,149 @@ class ReferenceFileSystem(AsyncFileSystem):
                     out[key] = [url]
         return out
 
+    @staticmethod
+    def _ref_size(part):
+        """Size to report for a reference part, without touching its target.
+
+        Inline data reports its stored length (as listings always have); a
+        whole-file reference reports ``None`` because resolving it would mean
+        asking the remote filesystem; an offset/size reference reports the
+        size recorded in the reference set.
+        """
+        if isinstance(part, (bytes, str)) or hasattr(part, "to_bytes"):
+            return len(part)
+        elif len(part) == 1:
+            return None
+        else:
+            return part[2]
+
+    @staticmethod
+    def _ref_parent(path):
+        return path.rsplit("/", 1)[0] if "/" in path else ""
+
+    def _build_index(self):
+        """Build the directory index from the in-memory references.
+
+        This is the only pass over the full reference set; afterwards listings
+        and updates are served from ``_dirs``/``_files`` in constant time per
+        entry, so neither repeated browsing nor a single-file update rescans
+        sibling references.
+        """
+        self._dirs = {"": {}}
+        self._files = {}
+        # Sorted names of each directory's children (files and directories),
+        # so prefix lookups can binary-search instead of comparing against
+        # every sibling.
+        self._dir_names = {"": []}
+        self._dir_stats["builds"] += 1
+        for path, part in self.references.items():
+            self._index_add(path, self._ref_size(part), initial=True)
+
+    def _ensure_dirs(self, path, count=False):
+        """Create the directory chain for ``path``, registering each level."""
+        missing = []
+        d = path
+        while d and d not in self._dirs:
+            missing.append(d)
+            d = self._ref_parent(d)
+        for child in reversed(missing):
+            parent = self._ref_parent(child)
+            self._dirs.setdefault(parent, {})
+            self._dirs[parent][("directory", child)] = {
+                "name": child,
+                "type": "directory",
+                "size": 0,
+            }
+            self._dirs[child] = {}
+            self._dir_names.setdefault(child, [])
+            self._child_name_add(parent, child)
+            if count:
+                self._dir_stats["dir_entries_created"] += 1
+
+    def _child_name_add(self, parent, name):
+        names = self._dir_names.setdefault(parent, [])
+        idx = bisect.bisect_left(names, name)
+        if idx == len(names) or names[idx] != name:
+            names.insert(idx, name)
+
+    def _child_name_remove(self, parent, name):
+        names = self._dir_names.get(parent)
+        if names:
+            idx = bisect.bisect_left(names, name)
+            if idx < len(names) and names[idx] == name:
+                del names[idx]
+
+    def _index_add(self, path, size, initial=False):
+        """Register a file entry (and its missing ancestors) in the index."""
+        info = {"name": path, "type": "file", "size": size}
+        self._files[path] = info
+        parent = self._ref_parent(path)
+        self._ensure_dirs(parent, count=not initial)
+        self._dirs[parent][("file", path)] = info
+        self._child_name_add(parent, path)
+        if initial:
+            self._dir_stats["keys_indexed"] += 1
+        else:
+            self._dir_stats["file_updates"] += 1
+
+    def _index_remove(self, path):
+        """Drop a file entry and prune directories left empty by the removal."""
+        if path not in self._files:
+            return
+        del self._files[path]
+        parent = self._ref_parent(path)
+        self._dirs.get(parent, {}).pop(("file", path), None)
+        self._child_name_remove(parent, path)
+        self._dir_stats["file_removals"] += 1
+        # A directory only exists while it (or one of its descendants) has a
+        # child, unless the same path is also a file. Walk up until a level
+        # still has content.
+        d = parent
+        while d and d in self._dirs and not self._dirs[d] and d not in self._files:
+            parent = self._ref_parent(d)
+            self._dirs.get(parent, {}).pop(("directory", d), None)
+            self._child_name_remove(parent, d)
+            del self._dirs[d]
+            self._dir_names.pop(d, None)
+            self._dir_stats["dir_entries_removed"] += 1
+            d = parent
+
+    def _index_after_write(self, path):
+        """Reflect a single reference write in the (already built) index."""
+        if isinstance(self.references, LazyReferenceMapper):
+            # leave lazy listings to be loaded on demand; drop anything cached
+            self.dircache.clear()
+            return
+        if self._dirs is not None:
+            self._index_add(path, self._ref_size(self.references[path]))
+
+    def _index_after_delete(self, path):
+        """Reflect a single reference removal in the (already built) index."""
+        if isinstance(self.references, LazyReferenceMapper):
+            self.dircache.clear()
+            return
+        if self._dirs is not None:
+            self._index_remove(path)
+
+    def _ensure_index(self):
+        """Make listing lookups available without rescanning references.
+
+        In-memory references get the incremental index. Lazy (parquet)
+        references keep their existing behaviour: a listing cache is filled
+        from the reference partitions only when a caller asks for one, and
+        only then are those partitions loaded.
+        """
+        if isinstance(self.references, LazyReferenceMapper):
+            if not self.dircache:
+                self._dircache_from_items()
+        elif self._dirs is None:
+            self._build_index()
+
     def _dircache_from_items(self):
         self.dircache = {"": []}
         it = self.references.items()
         for path, part in it:
-            if isinstance(part, (bytes, str)) or hasattr(part, "to_bytes"):
-                size = len(part)
-            elif len(part) == 1:
-                size = None
-            else:
-                _, _, size = part
+            size = self._ref_size(part)
             par = path.rsplit("/", 1)[0] if "/" in path else ""
             par0 = par
             subdirs = [par0]
@@ -1115,6 +1272,27 @@ class ReferenceFileSystem(AsyncFileSystem):
                 self.dircache[child] = []
 
             self.dircache[par].append({"name": path, "type": "file", "size": size})
+
+    def _ls_from_cache(self, path):
+        """Look up one listing without rescanning its siblings.
+
+        For in-memory references each file and directory is stored under its
+        own key, so listing a file, a directory, or ``find(detail=True)``'s
+        thousands of results costs one dictionary lookup each. Lazy references
+        fall back to the parent-list lookup of the base class.
+        """
+        if isinstance(self.references, LazyReferenceMapper):
+            return super()._ls_from_cache(path)
+        self._ensure_index()
+        self._dir_stats["lookups"] += 1
+        if path in self._dirs:
+            return list(self._dirs[path].values())
+        if path in self._files:
+            return [self._files[path]]
+        if self._ref_parent(path) in self._dirs:
+            # the parent is listed but does not contain this name
+            raise FileNotFoundError(path)
+        return None
 
     def _open(self, path, mode="rb", block_size=None, cache_options=None, **kwargs):
         part_or_url, start0, end0 = self._cat_common(path)
@@ -1151,8 +1329,7 @@ class ReferenceFileSystem(AsyncFileSystem):
             except KeyError:
                 pass
             raise FileNotFoundError(f"'{path}' is not a known key")
-        if not self.dircache:
-            self._dircache_from_items()
+        self._ensure_index()
         out = self._ls_from_cache(path)
         if out is None:
             raise FileNotFoundError(path)
@@ -1164,10 +1341,12 @@ class ReferenceFileSystem(AsyncFileSystem):
         return self.isdir(path) or self.isfile(path)
 
     def isdir(self, path):  # overwrite auto-sync version
-        if self.dircache:
-            return path in self.dircache
-        elif isinstance(self.references, LazyReferenceMapper):
+        if isinstance(self.references, LazyReferenceMapper):
+            if self.dircache:
+                return path in self.dircache
             return path in self.references.listdir()
+        elif self._dirs is not None:
+            return path in self._dirs
         else:
             # this may be faster than building dircache for single calls, but
             # by looping will be slow for many calls; could cache it?
@@ -1179,6 +1358,47 @@ class ReferenceFileSystem(AsyncFileSystem):
     async def _ls(self, path, detail=True, **kwargs):  # calls fast sync code
         return self.ls(path, detail, **kwargs)
 
+    def _ref_names_below(self, path):
+        """All reference keys starting with ``path``, in sorted order.
+
+        ``find`` keeps its historical prefix semantics (``"a"`` also matches
+        ``"ab"``). The index holds each directory's child names sorted, so
+        the parent directory is searched with one binary search and each
+        matching directory contributes its whole subtree. Work is
+        proportional to the number of results rather than to the size of the
+        reference set. Lazy references keep scanning their loaded keys.
+        """
+        if isinstance(self.references, LazyReferenceMapper):
+            return sorted(k for k in self.references if k.startswith(path))
+        self._ensure_index()
+        if not path:
+            return sorted(self._files)
+        parent = self._ref_parent(path)
+        names = self._dir_names.get(parent, [])
+        out = []
+        i = bisect.bisect_left(names, path)
+        while i < len(names) and names[i].startswith(path):
+            name = names[i]
+            if name in self._files:
+                out.append(name)
+            if name in self._dirs:
+                # every key below a matching directory matches too
+                out.extend(self._file_names_below(name))
+            i += 1
+        return sorted(out)
+
+    def _file_names_below(self, path):
+        """Names of all files in the subtree rooted at directory ``path``."""
+        out = []
+        stack = [self._dirs.get(path, {})]
+        while stack:
+            for entry in stack.pop().values():
+                if entry["type"] == "file":
+                    out.append(entry["name"])
+                else:
+                    stack.append(self._dirs.get(entry["name"], {}))
+        return out
+
     def find(self, path, maxdepth=None, withdirs=False, detail=False, **kwargs):
         if withdirs:
             return super().find(
@@ -1186,12 +1406,11 @@ class ReferenceFileSystem(AsyncFileSystem):
             )
         if path:
             path = self._strip_protocol(path)
-            r = sorted(k for k in self.references if k.startswith(path))
+            r = self._ref_names_below(path)
         else:
             r = sorted(self.references)
         if detail:
-            if not self.dircache:
-                self._dircache_from_items()
+            self._ensure_index()
             return {k: self._ls_from_cache(k)[0] for k in r}
         else:
             return r
@@ -1224,14 +1443,14 @@ class ReferenceFileSystem(AsyncFileSystem):
         self.references.pop(
             path, None
         )  # ignores FileNotFound, just as well for directories
-        self.dircache.clear()  # this is a bit heavy handed
+        self._index_after_delete(path)
 
     async def _pipe_file(self, path, data, mode="overwrite", **kwargs):
         if mode == "create" and self.exists(path):
             raise FileExistsError
         # can be str or bytes
         self.references[path] = data
-        self.dircache.clear()  # this is a bit heavy handed
+        self._index_after_write(path)
 
     async def _put_file(self, lpath, rpath, mode="overwrite", **kwargs):
         # puts binary
@@ -1239,7 +1458,7 @@ class ReferenceFileSystem(AsyncFileSystem):
             raise FileExistsError
         with open(lpath, "rb") as f:
             self.references[rpath] = f.read()
-        self.dircache.clear()  # this is a bit heavy handed
+        self._index_after_write(rpath)
 
     def save_json(self, url, **storage_options):
         """Write modified references into new location"""

@@ -961,3 +961,266 @@ def test_parquet_no_references(m):
     lz.flush()
 
     assert arr[...].tolist() == 1  #  scalar, equal to fill value
+
+
+def _counting_references(refs):
+    """A plain references dict that counts how often it is iterated.
+
+    Iterating the references is exactly the full-scan cost we want to avoid
+    when browsing a listing more than once, so tests can assert on ``iterations``
+    and on the per-lookup counters in ``fs._dir_stats``.
+    """
+    from collections import UserDict
+
+    class CountingDict(UserDict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    return CountingDict(refs)
+
+
+def test_ls_is_not_quadratic_in_siblings():
+    # 4000 siblings: a listing, then per-file ``ls``/``info`` must not rescan
+    # the collection each time (previously ~32M name comparisons).
+    refs = {f"collection/file{i:04d}": b"x" for i in range(4000)}
+    counting = _counting_references(refs)
+    fs = fsspec.filesystem("reference", fo=counting, skip_instance_cache=True)
+
+    assert fs.ls("collection", detail=False)[0] == "collection/file0000"
+    builds = fs._dir_stats["builds"]
+    iterations = counting.iterations
+    assert builds == 1
+    assert fs._dir_stats["keys_indexed"] == 4000
+
+    # browsing each result individually reuses the index
+    for name in ("collection/file0000", "collection/file2000"):
+        for _ in range(50):
+            assert fs.ls(name, detail=False) == [name]
+            assert fs.info(name)["size"] == 1
+    assert counting.iterations == iterations  # no full scan per lookup
+    assert fs._dir_stats["builds"] == builds
+
+    before = counting.iterations
+    found = fs.find("collection", detail=True)
+    assert len(found) == 4000
+    assert found["collection/file3999"] == {
+        "name": "collection/file3999",
+        "type": "file",
+        "size": 1,
+    }
+    # enumerating the results costs at most one pass, not one per result
+    assert counting.iterations - before <= 1
+    after = counting.iterations
+    assert fs.find("collection", detail=True) == found
+    assert counting.iterations - after <= 1
+    assert fs._dir_stats["builds"] == builds
+
+
+def test_scanning_counts_do_not_grow_with_rescans():
+    """Reproduce the reported slowdown with explicit work counters.
+
+    Browsing a 4000-sibling collection used to compare every listed name
+    against every sibling (~32M comparisons); here every lookup is counted
+    and must be answered from the index instead of a rescan.
+    """
+    refs = {"collection/target": b"abc"}
+    refs.update({f"collection/file{i:04d}": b"x" for i in range(4000)})
+    counting = _counting_references(refs)
+    fs = fsspec.filesystem("reference", fo=counting, skip_instance_cache=True)
+
+    first = fs.ls("collection", detail=True)
+    assert len(first) == 4001
+    assert fs._dir_stats["builds"] == 1
+    assert fs._dir_stats["keys_indexed"] == 4001
+    builds = fs._dir_stats["builds"]
+    iterations = counting.iterations
+
+    # listing every result individually costs one lookup each, no rescan
+    all_names = fs.find("collection", detail=False)
+    before_find = counting.iterations
+    lookups = fs._dir_stats["lookups"]
+    for entry in all_names:
+        assert fs.ls(entry, detail=False) == [entry]
+    assert fs._dir_stats["lookups"] - lookups == len(all_names)
+    assert fs._dir_stats["builds"] == builds
+    assert counting.iterations - before_find <= 1
+
+    # the 3 -> 11 byte overwrite updates exactly one entry, in place
+    updates = fs._dir_stats["file_updates"]
+    before_write = counting.iterations
+    fs.pipe_file("collection/target", b"0123456789a")
+    assert fs._dir_stats["file_updates"] - updates == 1
+    assert fs.info("collection/target")["size"] == 11
+    assert fs.ls("collection/target", detail=True) == [
+        {"name": "collection/target", "type": "file", "size": 11}
+    ]
+    assert fs.find("collection", detail=True)["collection/target"]["size"] == 11
+    assert counting.iterations - before_write <= 1
+    assert fs._dir_stats["builds"] == builds
+
+
+def test_ls_single_directory_does_not_scan_other_directories():
+    refs = {"wanted/a": b"1", "wanted/b": b"2"}
+    refs.update({f"other{i}/file": b"x" for i in range(500)})
+    counting = _counting_references(refs)
+    fs = fsspec.filesystem("reference", fo=counting, skip_instance_cache=True)
+
+    assert fs.ls("wanted", detail=False) == ["wanted/a", "wanted/b"]
+    iterations = counting.iterations
+
+    # a single small-directory update and re-list must not rescan the rest
+    fs.pipe_file("wanted/c", b"333")
+    assert fs.ls("wanted", detail=False) == ["wanted/a", "wanted/b", "wanted/c"]
+    assert fs.info("wanted/c")["size"] == 3
+    fs.rm_file("wanted/b")
+    assert fs.ls("wanted", detail=False) == ["wanted/a", "wanted/c"]
+    assert counting.iterations == iterations
+    # only the intended entries were touched
+    assert fs._dir_stats["file_updates"] == 1
+    assert fs._dir_stats["file_removals"] == 1
+
+
+def test_listing_does_not_touch_targets(m):
+    # sizes come from the reference set; listing must not fetch target bytes
+    m.pipe("data", b"0123456789")
+    calls = []
+    orig = m.cat_file
+
+    def counting_cat_file(*args, **kwargs):
+        calls.append(args)
+        return orig(*args, **kwargs)
+
+    m.cat_file = counting_cat_file
+    try:
+        refs = {
+            "a": ["memory://data", 0, 3],
+            "b": ["memory://data"],
+            "c/d": b"inline",
+        }
+        fs = fsspec.filesystem("reference", fo=refs, fs=m, skip_instance_cache=True)
+        assert fs.ls("", detail=True) == [
+            {"name": "a", "type": "file", "size": 3},
+            {"name": "b", "type": "file", "size": None},
+            {"name": "c", "type": "directory", "size": 0},
+        ]
+        assert fs.find("", detail=True)["b"]["size"] is None
+        assert fs.find("", withdirs=True) == ["a", "b", "c", "c/d"]
+        assert calls == []
+    finally:
+        m.cat_file = orig
+
+
+def _assert_mutation_visible(fs, path, data, new_size):
+    """The same instance must reflect a write in every listing API."""
+    assert fs.info(path)["size"] == new_size
+    assert fs.isfile(path)
+    parent = path.rsplit("/", 1)[0] if "/" in path else ""
+    assert path in fs.ls(parent, detail=False)
+    assert path in fs.find("")
+    assert fs.find("", detail=True)[path]["size"] == new_size
+    assert fs.isfile(path)
+
+
+def test_sync_pipe_file_updates_listing(tmpdir):
+    fs = fsspec.filesystem(
+        "reference", fo={"a": b"xyz", "c/d": b"123"}, skip_instance_cache=True
+    )
+    assert fs.ls("", detail=False) == ["a", "c"]
+    assert fs.info("a")["size"] == 3
+
+    fs.pipe_file("a", b"0123456789a")  # 3 -> 11 bytes, same instance
+    _assert_mutation_visible(fs, "a", b"0123456789a", 11)
+    assert fs.ls("", detail=True) == [
+        {"name": "a", "type": "file", "size": 11},
+        {"name": "c", "type": "directory", "size": 0},
+    ]
+
+    # adding a/b/c shows ancestors, deleting the last child removes them
+    fs.pipe_file("new/deep/f", b"q")
+    assert fs.ls("", detail=False) == ["a", "c", "new"]
+    assert fs.isdir("new") and fs.isdir("new/deep")
+    assert fs.info("new") == {"name": "new", "type": "directory", "size": 0}
+    assert fs.find("new") == ["new/deep/f"]
+    fs.rm_file("new/deep/f")
+    assert not fs.isdir("new/deep")
+    assert not fs.isdir("new")
+    assert fs.ls("", detail=False) == ["a", "c"]
+    assert fs.find("", withdirs=True) == ["a", "c", "c/d"]
+
+    # pruning stops at a directory that still has another child
+    fs.rm_file("c/d")
+    assert not fs.isdir("c")
+    assert fs.ls("", detail=False) == ["a"]
+
+
+def test_sync_put_file_updates_listing(tmpdir):
+    src = str(tmpdir / "src")
+    with open(src, "wb") as f:
+        f.write(b"hello")
+
+    fs = fsspec.filesystem("reference", fo={}, skip_instance_cache=True)
+    assert fs.ls("") == []
+    fs.put_file(src, "p/q.txt")
+    assert fs.ls("p", detail=False) == ["p/q.txt"]
+    assert fs.info("p/q.txt")["size"] == 5
+    assert fs.isdir("p")
+    assert fs.find("", withdirs=True) == ["p", "p/q.txt"]
+    assert fs.cat("p/q.txt") == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_async_mutations_update_listing(tmpdir):
+    fs = fsspec.filesystem(
+        "reference",
+        fo={"a": b"xyz", "c/d": b"123"},
+        skip_instance_cache=True,
+        asynchronous=True,
+    )
+    await fs._ls("")
+    await fs._pipe_file("a", b"0123456789a")
+    _assert_mutation_visible(fs, "a", b"0123456789a", 11)
+
+    await fs._pipe_file("n/e/w", b"q")
+    assert await fs._isdir("n") and await fs._isdir("n/e")
+    assert await fs._ls("", detail=False) == ["a", "c", "n"]
+    assert await fs._find("n") == ["n/e/w"]
+
+    await fs._rm_file("n/e/w")
+    assert not await fs._isdir("n")
+    assert await fs._ls("", detail=False) == ["a", "c"]
+
+    src = str(tmpdir / "src")
+    with open(src, "wb") as f:
+        f.write(b"hello")
+    await fs._put_file(src, "put/me")
+    assert await fs._ls("put", detail=False) == ["put/me"]
+    assert (await fs._info("put/me"))["size"] == 5
+    assert await fs._find("", withdirs=True) == ["a", "c", "c/d", "put", "put/me"]
+
+    await fs._rm_file("c/d")
+    assert not await fs._isdir("c")
+    assert await fs._ls("", detail=False) == ["a", "put"]
+
+
+def test_removing_one_of_file_and_directory_same_name():
+    fs = fsspec.filesystem(
+        "reference", fo={"a": b"x", "a/b": b"y"}, skip_instance_cache=True
+    )
+    assert fs.ls("", detail=True) == [
+        {"name": "a", "type": "file", "size": 1},
+        {"name": "a", "type": "directory", "size": 0},
+    ]
+    fs.rm_file("a")
+    # the directory remains because it still has a child
+    assert fs.ls("", detail=True) == [
+        {"name": "a", "type": "directory", "size": 0},
+    ]
+    assert fs.isdir("a")
+    fs.rm_file("a/b")
+    assert fs.ls("", detail=True) == []
+    assert not fs.isdir("a")
