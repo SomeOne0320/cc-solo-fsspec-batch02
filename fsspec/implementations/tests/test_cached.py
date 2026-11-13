@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import pickle
@@ -9,6 +10,7 @@ import pytest
 import fsspec
 from fsspec.compression import compr
 from fsspec.exceptions import BlocksizeMismatchError
+from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
 from fsspec.implementations.cache_mapper import (
     BasenameCacheMapper,
     HashCacheMapper,
@@ -20,6 +22,7 @@ from fsspec.implementations.cached import (
     WholeFileCacheFileSystem,
 )
 from fsspec.implementations.local import make_path_posix
+from fsspec.implementations.memory import MemoryFileSystem
 from fsspec.implementations.zip import ZipFileSystem
 from fsspec.tests.conftest import win
 
@@ -1388,3 +1391,323 @@ def test_simplecache_instance_cache(instance_caches):
         "file": 1,
         "http": 1,
     }
+
+
+class _AsyncMemoryFileSystem(AsyncFileSystemWrapper):
+    # _strip_protocol is not the identity, and ukey is the default, unlike http
+    protocol = "memory"
+    _strip_protocol = MemoryFileSystem._strip_protocol
+
+
+def _async_cache(protocol, cache_dir, sync_fs, **kwargs):
+    return fsspec.filesystem(
+        protocol,
+        fs=_AsyncMemoryFileSystem(fs=sync_fs),
+        cache_storage=str(cache_dir),
+        skip_instance_cache=True,
+        **kwargs,
+    )
+
+
+def _download_target(fs):
+    """The object whose ``get_file`` performs the actual backend download."""
+    return getattr(fs.fs, "sync_fs", fs.fs)
+
+
+def _patch_get_file(fs, monkeypatch, replacement):
+    target = _download_target(fs)
+    inner = target.get_file
+    monkeypatch.setattr(target, "get_file", replacement(inner))
+    if target is not fs.fs:
+        # the async wrapper bound the original methods at construction
+        fs.fs._wrap_all_sync_methods()
+
+
+def _count_downloads(fs, monkeypatch):
+    """Record the remote paths the backend is asked to download."""
+    downloads = []
+
+    def replacement(inner):
+        def counting(rpath, lpath, **kwargs):
+            downloads.append(rpath)
+            return inner(rpath, lpath, **kwargs)
+
+        return counting
+
+    _patch_get_file(fs, monkeypatch, replacement)
+    return downloads
+
+
+def _failing_downloads(fs, monkeypatch, fail_on, partial=b"partial"):
+    """Make one backend download write a fragment and then raise."""
+
+    def replacement(inner):
+        def failing(rpath, lpath, **kwargs):
+            if rpath == fail_on:
+                with open(lpath, "wb") as f:
+                    f.write(partial)
+                raise OSError(f"simulated download failure for {rpath}")
+            return inner(rpath, lpath, **kwargs)
+
+        return failing
+
+    _patch_get_file(fs, monkeypatch, replacement)
+
+
+def _cache_files(cache_dir):
+    return sorted(
+        f for f in os.listdir(cache_dir) if not f.startswith(".") and f != "cache"
+    )
+
+
+@pytest.mark.parametrize("protocol", ["filecache", "simplecache"])
+def test_read_entry_points_share_cache(tmp_path, m, monkeypatch, protocol):
+    # the same data warmed by open_files is reused by every other reader, and
+    # those readers may be interleaved freely
+    m.pipe({"/one": b"0123456789", "/two": b"abcdef"})
+    options = {"cache_storage": str(tmp_path), "same_names": True}
+    ofs = fsspec.open_files(
+        [f"{protocol}::memory://one", f"{protocol}::memory://two"],
+        mode="rb",
+        **{protocol: options},
+    )
+    fs = ofs.fs
+    with ofs as files:
+        assert [f.read() for f in files] == [b"0123456789", b"abcdef"]
+
+    downloads = _count_downloads(fs, monkeypatch)
+
+    # all subsequent reads, from every entry point, hit the local copy
+    with fs.open("/one", "rb") as f:
+        assert f.read() == b"0123456789"
+    assert fs.cat("/two") == b"abcdef"
+    assert fs.cat_file("/one", start=2, end=5) == b"234"
+    assert fs.cat(["/one", "/two"]) == {"/one": b"0123456789", "/two": b"abcdef"}
+    assert fs.cat_ranges(["/one", "/two"], [0, 1], [3, 4]) == [b"012", b"bcd"]
+    with fsspec.open(f"{protocol}::memory://one", "rb", **{protocol: options}) as f:
+        assert f.read() == b"0123456789"
+    assert downloads == []
+    assert len(_cache_files(str(tmp_path))) == 2
+
+
+@pytest.mark.parametrize("protocol", ["filecache", "simplecache"])
+def test_failed_single_download_leaves_no_cache_entry(
+    tmp_path, m, monkeypatch, protocol
+):
+    # a reader must never see a half-downloaded file, and a retry must work
+    m.pipe("/afile", b"0123456789")
+    fs = fsspec.filesystem(protocol, fs=m, cache_storage=str(tmp_path), same_names=True)
+    _failing_downloads(fs, monkeypatch, "/afile", partial=b"0123")
+
+    with pytest.raises(OSError, match="simulated download failure"):
+        fs.cat_file("/afile")
+    assert _cache_files(str(tmp_path)) == []
+    if protocol == "filecache":
+        assert fs._metadata.cached_files[-1] == {}
+
+    # retrying once the backend recovers succeeds
+    m.get_file = MemoryFileSystem.get_file.__get__(m)
+    assert fs.cat_file("/afile") == b"0123456789"
+    assert _cache_files(str(tmp_path)) == ["afile"]
+
+
+@pytest.mark.parametrize("protocol", ["filecache", "simplecache"])
+def test_batch_download_failure_keeps_complete_files(tmp_path, m, protocol):
+    # a mid-batch failure keeps files that were complete, and retries only
+    # the missing one; a partial copy is never exposed
+    m.pipe({"/one": b"0123456789", "/two": b"abcdef", "/three": b"xyz"})
+    options = {"cache_storage": str(tmp_path), "same_names": True}
+    fs = fsspec.filesystem(protocol, fs=m, **options)
+    inner = m.get_file
+
+    def fail_second(rpath, lpath, **kwargs):
+        if rpath == "/two":
+            with open(lpath, "wb") as f:
+                f.write(b"abc")
+            raise OSError("simulated mid-batch failure")
+        return inner(rpath, lpath, **kwargs)
+
+    m.get_file = fail_second
+    try:
+        ofs = fsspec.open_files(
+            [f"{protocol}::memory://one", f"{protocol}::memory://two"],
+            mode="rb",
+            **{protocol: options},
+        )
+        with pytest.raises(OSError):
+            ofs.__enter__()
+    finally:
+        m.get_file = inner
+
+    # the complete file from the failed batch is kept and usable, while the
+    # partial copy is not exposed; the next read fetches only the missing file
+    assert fs.cat_file("/one") == b"0123456789"
+    assert _cache_files(str(tmp_path)) == ["one"]
+    if protocol == "filecache":
+        assert "/two" not in fs._metadata.cached_files[-1]
+    assert fs.cat_file("/two") == b"abcdef"
+    assert fs.cat_file("/three") == b"xyz"
+    assert _cache_files(str(tmp_path)) == ["one", "three", "two"]
+
+
+@pytest.mark.parametrize("protocol", ["filecache", "simplecache"])
+def test_cat_batch_failure_on_error_return_and_omit(tmp_path, m, monkeypatch, protocol):
+    # ordering matters: the complete file is fetched before the failing one
+    m.pipe({"/aaa-good": b"0123456789", "/zzz-bad": b"abcdef"})
+    fs = fsspec.filesystem(protocol, fs=m, cache_storage=str(tmp_path), same_names=True)
+
+    def replacement(inner):
+        def fail_bad(rpath, lpath, **kwargs):
+            if rpath == "/zzz-bad":
+                with open(lpath, "wb") as f:
+                    f.write(b"ab")
+                raise OSError("boom")
+            return inner(rpath, lpath, **kwargs)
+
+        return fail_bad
+
+    _patch_get_file(fs, monkeypatch, replacement)
+    out = fs.cat(["/aaa-good", "/zzz-bad"], on_error="return")
+    assert out["/aaa-good"] == b"0123456789"
+    assert isinstance(out["/zzz-bad"], OSError)
+    assert fs.cat(["/aaa-good", "/zzz-bad"], on_error="omit") == {
+        "/aaa-good": b"0123456789"
+    }
+    with pytest.raises(OSError, match="boom"):
+        fs.cat(["/aaa-good", "/zzz-bad"])
+    assert "zzz-bad" not in _cache_files(str(tmp_path))
+    assert isinstance(
+        fs.cat_ranges(["/zzz-bad"], [0], [3], on_error="return")[0], OSError
+    )
+
+
+def test_filecache_failed_refresh_keeps_old_copy_and_record(tmp_path, m, monkeypatch):
+    # a refresh triggered by expiry must not damage the previous local copy
+    # or its metadata entry when the download fails
+    m.pipe("/afile", b"original")
+    fs = fsspec.filesystem(
+        "filecache",
+        fs=m,
+        cache_storage=str(tmp_path),
+        same_names=True,
+        expiry_time=1,
+        cache_check=False,
+    )
+    path = fs._strip_protocol("/afile")
+    assert fs.cat_file(path) == b"original"
+    old_detail = dict(fs._metadata.cached_files[-1][path])
+    old_fn = os.path.join(str(tmp_path), old_detail["fn"])
+    assert open(old_fn, "rb").read() == b"original"
+
+    # source changes and the record expires: the next read tries to refresh
+    m.pipe("/afile", b"replacement")
+    fs._metadata.cached_files[-1][path]["time"] -= 3600
+    old_detail = dict(fs._metadata.cached_files[-1][path])
+    _failing_downloads(fs, monkeypatch, path, partial=b"repl")
+
+    with pytest.raises(OSError, match="simulated download failure"):
+        fs.cat_file(path)
+
+    # the old copy and its record are untouched, and no partial file appears
+    assert open(old_fn, "rb").read() == b"original"
+    assert fs._metadata.cached_files[-1][path] == old_detail
+    assert open(os.path.join(str(tmp_path), "cache"), "rb").read() != b""
+    assert sorted(os.listdir(str(tmp_path))) == sorted(["afile", "cache"])
+
+    # once the backend recovers, the refresh succeeds and replaces both
+    m.get_file = MemoryFileSystem.get_file.__get__(m)
+    assert fs.cat_file(path) == b"replacement"
+    assert open(old_fn, "rb").read() == b"replacement"
+
+
+@pytest.mark.parametrize("protocol", ["filecache", "simplecache"])
+def test_alternate_sync_and_async_reads(tmp_path, m, monkeypatch, protocol):
+    m.pipe({"/one": b"0123456789", "/two": b"abcdef"})
+
+    async def run():
+        fs = _async_cache(protocol, tmp_path, m, same_names=True)
+        downloads = _count_downloads(fs, monkeypatch)
+        assert await fs._cat_file("/one") == b"0123456789"
+        assert await fs._cat_ranges(["/two", "/one"], [0, 4], [3, 8]) == [
+            b"abc",
+            b"4567",
+        ]
+        assert sorted(downloads) == ["/one", "/two"]
+
+    asyncio.run(run())
+
+    # ordinary sync instances over the same cache location reuse both files
+    fs = fsspec.filesystem(
+        protocol,
+        fs=m,
+        cache_storage=str(tmp_path),
+        same_names=True,
+        skip_instance_cache=True,
+    )
+    downloads = _count_downloads(fs, monkeypatch)
+    assert fs.cat("/one") == b"0123456789"
+    assert fs.cat_file("/two") == b"abcdef"
+    with fs.open("/one", "rb") as f:
+        assert f.read() == b"0123456789"
+    assert fs.cat_ranges(["/two"], [1], [4]) == [b"bcd"]
+    assert downloads == []
+
+
+@pytest.mark.parametrize("protocol", ["filecache", "simplecache"])
+def test_async_download_failure_not_cached(tmp_path, m, monkeypatch, protocol):
+    m.pipe({"/one": b"0123456789", "/two": b"abcdef"})
+
+    async def run():
+        fs = _async_cache(protocol, tmp_path, m, same_names=True)
+        _failing_downloads(fs, monkeypatch, "/two")
+
+        returned = await fs._cat_ranges(
+            ["/one", "/two"], [0, 0], [3, 3], on_error="return"
+        )
+        assert returned[0] == b"012"
+        assert isinstance(returned[1], OSError)
+        # the complete sibling is kept, the partial one is not
+        assert "one" in _cache_files(str(tmp_path))
+        assert "two" not in _cache_files(str(tmp_path))
+
+        with pytest.raises(OSError, match="simulated download failure"):
+            await fs._cat_file("/two")
+        assert await fs._cat_file("/one") == b"0123456789"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("protocol", ["filecache", "simplecache"])
+def test_multicache_reads_first_writable_last(tmp_path, m, protocol):
+    # several cache locations are searched in order, and only the last one is
+    # written; a failed refresh in an earlier location is not masked
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    fs1 = fsspec.filesystem(protocol, fs=m, cache_storage=str(first), same_names=True)
+    m.pipe("/afile", b"in-first")
+    assert fs1.cat_file("/afile") == b"in-first"
+
+    fs = fsspec.filesystem(
+        protocol,
+        fs=m,
+        cache_storage=[str(first), str(second)],
+        same_names=True,
+        skip_instance_cache=True,
+    )
+    m.pipe("/afile", b"changed")
+    m.pipe("/bfile", b"only-second")
+    assert fs.cat_file("/afile") == b"in-first"
+    assert fs.cat_file("/bfile") == b"only-second"
+    assert "bfile" in _cache_files(str(second))
+    assert "bfile" not in _cache_files(str(first))
+
+
+@pytest.mark.parametrize("protocol", ["filecache", "simplecache"])
+def test_simplecache_keeps_no_metadata_file(tmp_path, m, protocol):
+    m.pipe("/afile", b"0123456789")
+    fs = fsspec.filesystem(protocol, fs=m, cache_storage=str(tmp_path), same_names=True)
+    fs.cat_file("/afile")
+    if protocol == "simplecache":
+        assert not os.path.exists(os.path.join(str(tmp_path), "cache"))
+    else:
+        assert os.path.exists(os.path.join(str(tmp_path), "cache"))

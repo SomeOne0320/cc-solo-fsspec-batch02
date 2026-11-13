@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
+import secrets
 import tempfile
 import time
 import weakref
+from collections.abc import Callable
+from contextlib import contextmanager, suppress
+from hashlib import sha256
 from shutil import rmtree
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from fsspec import filesystem
+from fsspec.asyn import _run_coros_in_chunks
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.compression import compr
 from fsspec.core import BaseCache, MMapCache
@@ -18,7 +24,7 @@ from fsspec.implementations.cache_mapper import create_cache_mapper
 from fsspec.implementations.cache_metadata import CacheMetadata
 from fsspec.implementations.chained import ChainedFileSystem
 from fsspec.implementations.local import LocalFileSystem
-from fsspec.spec import AbstractBufferedFile
+from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from fsspec.transaction import Transaction
 from fsspec.utils import infer_compression
 
@@ -26,6 +32,108 @@ if TYPE_CHECKING:
     from fsspec.implementations.cache_mapper import AbstractCacheMapper
 
 logger = logging.getLogger("fsspec.cached")
+
+
+def _publish(tmp, lpath, start):
+    """Move a finished temporary download to its final cache name."""
+    try:
+        os.replace(tmp, lpath)
+    except PermissionError:
+        # Windows: the destination is open elsewhere. A same-size file
+        # written since this download began is a concurrent complete copy
+        # of the same remote file, and makes this one redundant.
+        if not (
+            os.path.isfile(lpath)
+            and os.path.getsize(lpath) == os.path.getsize(tmp)
+            and os.path.getmtime(lpath) >= start
+        ):
+            raise
+
+
+@contextmanager
+def _tempfile(lpath):
+    """Yield a temporary name to download into, then publish it.
+
+    Downloads are written beside their final cache location and only renamed
+    into place once complete, so that a reader never sees a partially written
+    file under the name that marks a cache entry as usable (#639). Temporary
+    files are removed when the download or the rename fails; a stale ``.part``
+    file left by a killed process is never treated as a cache entry.
+    """
+    tmp, start = _make_temp(lpath)
+    try:
+        yield tmp
+        _publish(tmp, lpath, start)
+    finally:
+        with suppress(OSError):
+            os.remove(tmp)
+
+
+def _make_temp(lpath):
+    """Create and remove a placeholder temp name, returning it and its mtime.
+
+    The timestamp is read from the cache filesystem's clock (rather than
+    ``time.time()``), so it can be compared with a destination's mtime.
+    """
+    tmp = os.path.join(os.path.dirname(lpath), f"{secrets.token_hex(8)}.part")
+    open(tmp, "wb").close()
+    start = os.path.getmtime(tmp)
+    os.remove(tmp)
+    return tmp, start
+
+
+def _atomic_get(fs, rpaths, lpaths):
+    """Download several files in one batch, publishing only complete ones.
+
+    Every target is written to its own temporary file first. If the backend's
+    batch call fails, each temporary file whose length matches the remote
+    object is still published; partial and absent downloads are discarded.
+    Files that completed before the failure are therefore kept, while nothing
+    that only partly arrived becomes visible as a cache entry.
+
+    Returns a dict mapping the remote paths that did not complete to the
+    exception raised by the batch.
+    """
+    tmps = []
+    starts = []
+    for fn in lpaths:
+        tmp, start = _make_temp(fn)
+        tmps.append(tmp)
+        starts.append(start)
+    error = None
+    try:
+        fs.get(rpaths, tmps)
+    except Exception as e:
+        error = e
+    errors = {}
+    for rpath, tmp, fn, start in zip(rpaths, tmps, lpaths, starts):
+        complete = error is None
+        if error is not None:
+            # the batch stopped part-way: keep only files whose full length
+            # arrived, so a retry downloads exactly what is still missing
+            complete = _download_complete(fs, rpath, tmp)
+        if not complete:
+            with suppress(OSError):
+                os.remove(tmp)
+            errors[rpath] = error
+            continue
+        try:
+            _publish(tmp, fn, start)
+        except OSError as e:
+            errors[rpath] = e
+        finally:
+            with suppress(OSError):
+                os.remove(tmp)
+    return errors
+
+
+def _download_complete(fs, rpath, tmp):
+    """Whether a temporary file holds the complete remote object."""
+    try:
+        size = fs.size(rpath)
+        return size is not None and os.path.getsize(tmp) == size
+    except Exception:
+        return False
 
 
 class WriteCachedTransaction(Transaction):
@@ -433,6 +541,23 @@ class CachingFileSystem(ChainedFileSystem):
             "__getattribute__",
             "__reduce__",
             "_make_local_details",
+            "_detail_and_fn",
+            "_cached_now",
+            "_cache_paths",
+            "_cache_paths_async",
+            "_record_download",
+            "_record_download_async",
+            "_download_one",
+            "_download_into",
+            "_copy_decoded",
+            "_decompress_file",
+            "_download_missing",
+            "_download_missing_async",
+            "_atomic_get_async",
+            "_download_async",
+            "_check_file_async",
+            "_ukey_async",
+            "_local_paths_for_ranges",
             "open",
             "cat",
             "cat_file",
@@ -472,9 +597,12 @@ class CachingFileSystem(ChainedFileSystem):
         }:
             # all the methods defined in this class. Note `open` here, since
             # it calls `_open`, but is actually in superclass
-            return lambda *args, **kw: getattr(type(self), item).__get__(self)(
-                *args, **kw
-            )
+            if hasattr(type(self), item):
+                return lambda *args, **kw: getattr(type(self), item).__get__(self)(
+                    *args, **kw
+                )
+            # method is only listed for the base class; fall through to the
+            # wrapped filesystem, just like any other attribute
         if item in ["__reduce_ex__"]:
             raise AttributeError
         if item in ["transaction"]:
@@ -554,6 +682,341 @@ class WholeFileCacheFileSystem(CachingFileSystem):
     protocol = "filecache"
     local_file = True
 
+    def _cache_paths(self, paths):
+        """Local cache file for each of ``paths``, and which need downloading.
+
+        This is the single place where whole-file reads decide what is already
+        available. A valid local copy is reused; a missing (or stale) one is
+        listed for a batched download from the backend. Duplicate paths share
+        one cache file and are downloaded once.
+
+        Returns ``(local_paths, remote_paths, local_paths_to_download)``, where
+        ``local_paths`` has one entry per input path, in order.
+        """
+        local = {}
+        lpaths = []
+        rpaths = []
+        download = []
+        for p in paths:
+            p = self._strip_protocol(p)
+            if p not in local:
+                cached = self._detail_and_fn(p)
+                if not cached or cached[0]["blocks"] is not True:
+                    # missing, stale, or a sparse blockcache entry in this
+                    # directory: re-download the whole file
+                    fn = os.path.join(self.storage[-1], self._mapper(p))
+                    if fn not in download:
+                        download.append(fn)
+                        rpaths.append(p)
+                else:
+                    fn = cached[1]
+                local[p] = fn
+            lpaths.append(local[p])
+        return lpaths, rpaths, download
+
+    def _record_download(self, path, uid=None):
+        """Record a completed whole-file download in the cache metadata."""
+        self._make_local_details(path, uid=uid)
+
+    def _local_paths_for_ranges(self, paths):
+        """Local cache files for ``paths``, downloading missing ones.
+
+        A path repeated in ``paths`` maps to a single cache file, downloaded
+        once. On failure, complete sibling downloads are kept and the backend
+        error is raised; ``pathlib``/``zarr``-style callers see that rather
+        than a local missing-file error.
+        """
+        return self._download_missing(paths)
+
+    async def _record_download_async(self, path):
+        """Async variant of ``_record_download``, using an async-safe ukey."""
+        self._record_download(path, uid=await self._ukey_async(path))
+
+    def _download_into(self, path, fn, **kwargs):
+        """Write a complete copy of ``path`` to cache file ``fn``."""
+        kwargs.pop("mode", None)
+        if self.compression:
+            with (
+                _tempfile(fn) as tmp,
+                self.fs._open(path, mode="rb", **kwargs) as f,
+                open(tmp, "wb") as f2,
+            ):
+                if isinstance(f, AbstractBufferedFile):
+                    # want no type of caching if just downloading whole thing
+                    f.cache = BaseCache(0, f.cache.fetcher, f.size)
+                self._copy_decoded(path, f, f2)
+        else:
+            with _tempfile(fn) as tmp:
+                self.fs.get_file(path, tmp)
+
+    def _copy_decoded(self, path, f, out):
+        """Copy an already-opened remote stream into ``out``, decompressing."""
+        comp = (
+            infer_compression(path) if self.compression == "infer" else self.compression
+        )
+        f = compr[comp](f, mode="rb")
+        data = True
+        while data:
+            block = getattr(f, "blocksize", 5 * 2**20)
+            data = f.read(block)
+            out.write(data)
+
+    def _decompress_file(self, path, source, destination):
+        """Decompress the local file ``source`` into ``destination``."""
+        with open(source, "rb") as f, open(destination, "wb") as out:
+            self._copy_decoded(path, f, out)
+
+    def _detail_and_fn(self, path):
+        """Normalised ``(detail, local_path)`` for a cached path, else ``None``.
+
+        The whole-file caches differ in what ``_check_file`` returns: filecache
+        gives ``(detail, fn)``, simplecache gives just ``fn``.
+        """
+        hit = self._check_file(path)
+        if not hit:
+            return None
+        if isinstance(hit, tuple):
+            return hit
+        return {"original": path, "blocks": True}, hit
+
+    def _download_one(self, path, **kwargs):
+        """Fetch one whole file and return its local cache path.
+
+        The download is written to a temporary file and only published under
+        its final cache name when complete; only then is it recorded, so a
+        failed refresh leaves any previous copy and its record untouched.
+        """
+        fn = os.path.join(self.storage[-1], self._mapper(path))
+        self._mkcache()
+        self._download_into(path, fn, **kwargs)
+        self._cache_size = None
+        self._record_download(path)
+        self.save_cache()
+        return fn
+
+    def _download_missing(self, paths, **kwargs):
+        """Fetch the paths that are not cached, as one batch.
+
+        Returns the local cache file for each input path. Each download is
+        published under its final cache name only when complete, and recorded
+        only when the whole batch has been attempted. A failure keeps the
+        files that did complete (and their records), discards partial copies,
+        and then raises the backend error; a later read retries only what is
+        still missing.
+        """
+        lpaths, rpaths, download = self._cache_paths(paths)
+        if not download:
+            return lpaths
+        if self.compression:
+            # a decompressing copy must go through the target's own open()
+            # stream, so it cannot use the backend's batched get
+            error = None
+            for path in rpaths:
+                try:
+                    self._download_one(path, **kwargs)
+                except Exception as e:
+                    error = error or e
+            if error is not None:
+                raise error
+            return self._cache_paths(paths)[0]
+        errors = _atomic_get(self.fs, rpaths, download)
+        for path in rpaths:
+            if path in errors:
+                continue
+            try:
+                self._record_download(path)
+            except Exception as e:
+                # the copy is complete and usable, but without a record a
+                # later check will simply download it again
+                errors[path] = e
+        self.save_cache()
+        if errors:
+            raise next(iter(errors.values()))
+        return lpaths
+
+    async def _check_file_async(self, path):
+        """Async-safe validity check for a cache entry."""
+        path = self._strip_protocol(path)
+        self._check_cache()
+        detail = self._metadata.check_file(path, None)
+        if not detail:
+            return False
+        detail, fn = detail
+        if detail["blocks"] is not True:
+            # a partial blockcache entry sharing this directory
+            return False
+        if self.check_files and detail["uid"] != await self._ukey_async(path):
+            return False
+        if self.expiry and time.time() - detail["time"] > self.expiry:
+            return False
+        return fn
+
+    async def _ukey_async(self, path):
+        """Compute the target's unique key without blocking the event loop."""
+        if type(self.fs).ukey is AbstractFileSystem.ukey:
+            return sha256(str(await self.fs._info(path)).encode()).hexdigest()
+        return await asyncio.to_thread(self.fs.ukey, path)
+
+    async def _cache_paths_async(self, paths):
+        """Async equivalent of ``_cache_paths`` for batch async reads."""
+        paths = [self._strip_protocol(p) for p in paths]
+        local = {}
+        lpaths = []
+        need = {}
+        for p in paths:
+            if p not in local:
+                local[p] = await self._check_file_async(p) or need.setdefault(
+                    p, os.path.join(self.storage[-1], self._mapper(p))
+                )
+            lpaths.append(local[p])
+        return lpaths, need
+
+    async def _download_missing_async(self, paths, **kwargs):
+        """Async batch download of the paths that are not cached.
+
+        Mirrors ``_download_missing``: the backend is asked for all missing
+        files at once, each is published only when complete, and complete
+        siblings survive a failure of another file in the batch.
+        """
+        lpaths, need = await self._cache_paths_async(paths)
+        if not need:
+            return lpaths
+        if self.compression:
+            # decompressing copies need the target's own open() stream
+            results = await _run_coros_in_chunks(
+                [self._download_async(p, fn, **kwargs) for p, fn in need.items()],
+                batch_size=getattr(self.fs, "batch_size", None),
+                return_exceptions=True,
+            )
+            errors = {p: e for p, e in zip(need, results) if isinstance(e, Exception)}
+        else:
+            errors = await self._atomic_get_async(dict(need), **kwargs)
+        self.save_cache()
+        if errors:
+            raise next(iter(errors.values()))
+        return lpaths
+
+    async def _atomic_get_async(self, need, **kwargs):
+        """Batched async download into per-file temporary names."""
+        rpaths = list(need)
+        fns = list(need.values())
+        tmps = []
+        starts = []
+        for fn in fns:
+            tmp, start = await asyncio.to_thread(_make_temp, fn)
+            tmps.append(tmp)
+            starts.append(start)
+        error = None
+        try:
+            await self.fs._get(rpaths, tmps, **kwargs)
+        except Exception as e:
+            error = e
+        errors = {}
+        sizes = [None] * len(rpaths)
+        if error is not None:
+            # ask about each remote object separately: a single missing path
+            # must not hide the files that did complete in the batch
+            for i, rpath in enumerate(rpaths):
+                try:
+                    sizes[i] = await self.fs._size(rpath)
+                except Exception:
+                    pass
+        for rpath, tmp, fn, start, size in zip(rpaths, tmps, fns, starts, sizes):
+            complete = error is None
+            if error is not None:
+                complete = size is not None and (
+                    await asyncio.to_thread(os.path.getsize, tmp) == size
+                )
+            try:
+                if not complete:
+                    errors[rpath] = error
+                    continue
+                await asyncio.to_thread(_publish, tmp, fn, start)
+                await self._record_download_async(rpath)
+            except Exception as e:
+                errors[rpath] = e
+            finally:
+                with suppress(OSError):
+                    await asyncio.to_thread(os.remove, tmp)
+        return errors
+
+    async def _download_async(self, path, fn, **kwargs):
+        """Async single-file download, published and recorded when complete."""
+        self._mkcache()
+        if self.compression:
+            raw = os.path.join(os.path.dirname(fn), f"{secrets.token_hex(8)}.part")
+            try:
+                await self.fs._get_file(path, raw, **kwargs)
+                with _tempfile(fn) as tmp:
+                    await asyncio.to_thread(self._decompress_file, path, raw, tmp)
+            finally:
+                with suppress(OSError):
+                    os.remove(raw)
+        else:
+            with _tempfile(fn) as tmp:
+                await self.fs._get_file(path, tmp, **kwargs)
+        self._cache_size = None
+        await self._record_download_async(path)
+        self.save_cache()
+        return fn
+
+    async def _cat_file(self, path, start=None, end=None, **kwargs):
+        logger.debug("async cat_file %s", path)
+        path = self._strip_protocol(path)
+        fn = await self._check_file_async(path)
+        if not fn:
+            fn = os.path.join(self.storage[-1], self._mapper(path))
+            await self._download_async(path, fn, **kwargs)
+        with open(fn, "rb") as f:  # noqa ASYNC230
+            if start:
+                f.seek(start)
+            size = -1 if end is None else end - f.tell()
+            return f.read(size)
+
+    async def _cat_ranges(
+        self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
+    ):
+        logger.debug("async cat ranges %s", paths)
+        paths = [self._strip_protocol(p) for p in paths]
+        errors = {}
+        try:
+            lpaths = await self._download_missing_async(paths)
+        except Exception as e:
+            if on_error == "raise":
+                raise
+            # complete siblings from the same batch are still readable; the
+            # backend error is reported for the rest, not a local-miss error
+            lpaths, need = await self._cache_paths_async(paths)
+            errors = {}
+            for i, p in enumerate(paths):
+                if p not in need:
+                    continue
+                try:
+                    if not await self._check_file_async(p):
+                        errors[i] = e
+                except Exception:
+                    errors[i] = e
+        readable = [i for i, lp in enumerate(lpaths) if i not in errors]
+        results = LocalFileSystem().cat_ranges(
+            [lpaths[i] for i in readable],
+            [starts[i] for i in readable],
+            [ends[i] for i in readable],
+            max_gap=max_gap,
+            on_error="return",
+            **kwargs,
+        )
+        out = [None] * len(paths)
+        for i, value in zip(readable, results):
+            out[i] = value
+        for i, e in errors.items():
+            out[i] = e
+        if on_error == "return":
+            return out
+        ex = next((o for o in out if isinstance(o, Exception)), None)
+        if ex is not None:
+            raise ex
+        return out
+
     def open_many(self, open_files, **kwargs):
         paths = [of.path for of in open_files]
         if "r" in open_files.mode:
@@ -572,40 +1035,7 @@ class WholeFileCacheFileSystem(CachingFileSystem):
 
         if self.compression:
             raise NotImplementedError
-        details = [self._check_file(sp) for sp in paths]
-        downpath = [p for p, d in zip(paths, details) if not d]
-        downfn0 = [
-            os.path.join(self.storage[-1], self._mapper(p))
-            for p, d in zip(paths, details)
-        ]  # keep these path names for opening later
-        downfn = [fn for fn, d in zip(downfn0, details) if not d]
-        if downpath:
-            # skip if all files are already cached and up to date
-            self.fs.get(downpath, downfn)
-
-            # update metadata - only happens when downloads are successful
-            newdetail = [
-                {
-                    "original": path,
-                    "fn": self._mapper(path),
-                    "blocks": True,
-                    "time": time.time(),
-                    "uid": self.fs.ukey(path),
-                }
-                for path in downpath
-            ]
-            for path, detail in zip(downpath, newdetail):
-                self._metadata.update_file(path, detail)
-            self.save_cache()
-
-        def firstpart(fn):
-            # helper to adapt both whole-file and simple-cache
-            return fn[1] if isinstance(fn, tuple) else fn
-
-        return [
-            open(firstpart(fn0) if fn0 else fn1, mode=open_files.mode)
-            for fn0, fn1 in zip(details, downfn0)
-        ]
+        return [open(fn, mode=open_files.mode) for fn in self._download_missing(paths)]
 
     def commit_many(self, open_files):
         self.fs.put([f.fn for f in open_files], [f.path for f in open_files])
@@ -618,7 +1048,7 @@ class WholeFileCacheFileSystem(CachingFileSystem):
                 pass
         self._cache_size = None
 
-    def _make_local_details(self, path):
+    def _make_local_details(self, path, uid=None):
         hash = self._mapper(path)
         fn = os.path.join(self.storage[-1], hash)
         detail = {
@@ -626,11 +1056,28 @@ class WholeFileCacheFileSystem(CachingFileSystem):
             "fn": hash,
             "blocks": True,
             "time": time.time(),
-            "uid": self.fs.ukey(path),
+            "uid": self.fs.ukey(path) if uid is None else uid,
         }
         self._metadata.update_file(path, detail)
         logger.debug("Copying %s to local cache", path)
         return fn
+
+    def _cached_now(self, paths):
+        """Which of ``paths`` are safe to read from cache right now.
+
+        Used after a batch download failed, to tell the files that completed
+        from those that did not. A check that itself errors is treated as a
+        miss, so that the original download error is the one reported.
+        """
+        usable = set()
+        for i, p in enumerate(paths):
+            try:
+                cached = self._detail_and_fn(p)
+            except Exception:
+                continue
+            if cached and cached[0]["blocks"] is True:
+                usable.add(i)
+        return usable
 
     def cat(
         self,
@@ -643,38 +1090,31 @@ class WholeFileCacheFileSystem(CachingFileSystem):
         paths = self.expand_path(
             path, recursive=recursive, maxdepth=kwargs.get("maxdepth")
         )
-        getpaths = []
-        storepaths = []
-        fns = []
         out = {}
-        for p in paths.copy():
-            try:
-                detail = self._check_file(p)
-                if not detail:
-                    fn = self._make_local_details(p)
-                    getpaths.append(p)
-                    storepaths.append(fn)
-                else:
-                    detail, fn = detail if isinstance(detail, tuple) else (None, detail)
-                fns.append(fn)
-            except Exception as e:
-                if on_error == "raise":
-                    raise
+        errors = {}
+        try:
+            lpaths = self._download_missing(paths)
+        except Exception as e:
+            if on_error == "raise":
+                raise
+            # The batch kept whatever completed usable; read those, and report
+            # the backend error for the rest rather than a local-miss error.
+            lpaths = self._cache_paths(paths)[0]
+            usable = self._cached_now(paths)
+            errors = {i: e for i in range(len(paths)) if i not in usable}
+
+        callback.set_size(len(paths) - len(errors))
+        for i, (p, lpath) in enumerate(zip(paths, lpaths)):
+            if i in errors:
                 if on_error == "return":
-                    out[p] = e
-                paths.remove(p)
-
-        if getpaths:
-            self.fs.get(getpaths, storepaths)
-            self.save_cache()
-
-        callback.set_size(len(paths))
-        for p, fn in zip(paths, fns):
-            with open(fn, "rb") as f:
-                out[p] = f.read()
+                    out[p] = errors[i]
+            else:
+                with open(lpath, "rb") as f:
+                    out[p] = f.read()
             callback.relative_update(1)
         if isinstance(path, str) and len(paths) == 1 and recursive is False:
-            out = out[paths[0]]
+            if paths[0] in out:
+                out = out[paths[0]]
         return out
 
     def _open(self, path, mode="rb", **kwargs):
@@ -689,11 +1129,10 @@ class WholeFileCacheFileSystem(CachingFileSystem):
                 if k not in ["autocommit", "block_size", "cache_options"]
             }
             return LocalTempFile(self, path, mode=mode, fn=fn, **user_specified_kwargs)
-        detail = self._check_file(path)
-        if detail:
-            detail, fn = detail
-            _, blocks = detail["fn"], detail["blocks"]
-            if blocks is True:
+        cached = self._detail_and_fn(path)
+        if cached:
+            detail, fn = cached
+            if detail["blocks"] is True:
                 logger.debug("Opening local copy of %s", path)
 
                 # In order to support downstream filesystems to be able to
@@ -709,31 +1148,10 @@ class WholeFileCacheFileSystem(CachingFileSystem):
                     f"Attempt to open partially cached file {path}"
                     f" as a wholly cached file"
                 )
-        else:
-            fn = self._make_local_details(path)
         kwargs["mode"] = mode
 
         # call target filesystems open
-        self._mkcache()
-        if self.compression:
-            with self.fs._open(path, **kwargs) as f, open(fn, "wb") as f2:
-                if isinstance(f, AbstractBufferedFile):
-                    # want no type of caching if just downloading whole thing
-                    f.cache = BaseCache(0, f.cache.fetcher, f.size)
-                comp = (
-                    infer_compression(path)
-                    if self.compression == "infer"
-                    else self.compression
-                )
-                f = compr[comp](f, mode="rb")
-                data = True
-                while data:
-                    block = getattr(f, "blocksize", 5 * 2**20)
-                    data = f.read(block)
-                    f2.write(data)
-        else:
-            self.fs.get_file(path, fn)
-        self.save_cache()
+        self._download_one(path, **kwargs)
         return self._open(path, mode)
 
 
@@ -779,6 +1197,18 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
 
     def load_cache(self):
         pass
+
+    def _record_download(self, path, uid=None):
+        # simplecache keeps no metadata; the local file itself is the record
+        pass
+
+    async def _record_download_async(self, path):
+        # simplecache keeps no metadata; the local file itself is the record
+        pass
+
+    async def _check_file_async(self, path):
+        # existence-based, so the sync check performs no remote I/O
+        return self._check_file(path)
 
     def pipe_file(self, path, value=None, **kwargs):
         if self._intrans:
@@ -840,64 +1270,47 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
         else:
             raise ValueError("path must be str or dict")
 
-    async def _cat_file(self, path, start=None, end=None, **kwargs):
-        logger.debug("async cat_file %s", path)
-        path = self._strip_protocol(path)
-        sha = self._mapper(path)
-        fn = self._check_file(path)
-
-        if not fn:
-            fn = os.path.join(self.storage[-1], sha)
-            await self.fs._get_file(path, fn, **kwargs)
-
-        with open(fn, "rb") as f:  # noqa ASYNC230
-            if start:
-                f.seek(start)
-            size = -1 if end is None else end - f.tell()
-            return f.read(size)
-
-    async def _cat_ranges(
-        self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
-    ):
-        logger.debug("async cat ranges %s", paths)
-        lpaths = []
-        rset = set()
-        download = []
-        rpaths = []
-        for p in paths:
-            fn = self._check_file(p)
-            if fn is None and p not in rset:
-                sha = self._mapper(p)
-                fn = os.path.join(self.storage[-1], sha)
-                download.append(fn)
-                rset.add(p)
-                rpaths.append(p)
-            lpaths.append(fn)
-        if download:
-            await self.fs._get(rpaths, download, on_error=on_error)
-
-        return LocalFileSystem().cat_ranges(
-            lpaths, starts, ends, max_gap=max_gap, on_error=on_error, **kwargs
-        )
-
     def cat_ranges(
         self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
     ):
         logger.debug("cat ranges %s", paths)
-        lpaths = [self._check_file(p) for p in paths]
-        rpaths = [p for l, p in zip(lpaths, paths) if l is False]
-        lpaths = [l for l, p in zip(lpaths, paths) if l is False]
-        self.fs.get(rpaths, lpaths)
-        paths = [self._check_file(p) for p in paths]
-        return LocalFileSystem().cat_ranges(
-            paths, starts, ends, max_gap=max_gap, on_error=on_error, **kwargs
+        errors = {}
+        try:
+            lpaths = self._local_paths_for_ranges(paths)
+        except Exception as e:
+            if on_error == "raise":
+                raise
+            # complete siblings from the same batch remain readable; the
+            # backend error is reported for the paths that are still missing
+            lpaths = self._cache_paths(paths)[0]
+            usable = self._cached_now(paths)
+            errors = {i: e for i in range(len(paths)) if i not in usable}
+
+        readable = [i for i, lp in enumerate(lpaths) if i not in errors]
+        results = LocalFileSystem().cat_ranges(
+            [lpaths[i] for i in readable],
+            [starts[i] for i in readable],
+            [ends[i] for i in readable],
+            max_gap=max_gap,
+            on_error="return",
+            **kwargs,
         )
+        out = [None] * len(paths)
+        for i, value in zip(readable, results):
+            out[i] = value
+        for i, e in errors.items():
+            out[i] = e
+        if on_error == "return":
+            return out
+        ex = next((o for o in out if isinstance(o, Exception)), None)
+        if ex is not None:
+            raise ex
+        return out
 
     def _open(self, path, mode="rb", **kwargs):
         path = self._strip_protocol(path)
-        sha = self._mapper(path)
-
         if "r" not in mode:
+            sha = self._mapper(path)
             fn = os.path.join(self.storage[-1], sha)
             user_specified_kwargs = {
                 k: v
@@ -912,35 +1325,8 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
                 fn=fn,
                 **user_specified_kwargs,
             )
-        fn = self._check_file(path)
-        if fn:
-            return open(fn, mode)
-
-        fn = os.path.join(self.storage[-1], sha)
-        logger.debug("Copying %s to local cache", path)
-        kwargs["mode"] = mode
-
-        self._mkcache()
-        self._cache_size = None
-        if self.compression:
-            with self.fs._open(path, **kwargs) as f, open(fn, "wb") as f2:
-                if isinstance(f, AbstractBufferedFile):
-                    # want no type of caching if just downloading whole thing
-                    f.cache = BaseCache(0, f.cache.fetcher, f.size)
-                comp = (
-                    infer_compression(path)
-                    if self.compression == "infer"
-                    else self.compression
-                )
-                f = compr[comp](f, mode="rb")
-                data = True
-                while data:
-                    block = getattr(f, "blocksize", 5 * 2**20)
-                    data = f.read(block)
-                    f2.write(data)
-        else:
-            self.fs.get_file(path, fn)
-        return self._open(path, mode)
+        # reads, including compressed ones, use the shared whole-file flow
+        return super()._open(path, mode, **kwargs)
 
 
 class LocalTempFile:
