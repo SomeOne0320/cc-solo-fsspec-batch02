@@ -547,6 +547,11 @@ def merge_offset_ranges(
     will re-order the input paths and byte ranges to ensure sorted
     order. If the user can guarantee that the inputs are already
     sorted, passing `sort=False` will skip the re-ordering.
+
+    Ranges with ``start=None`` request whole files; they are never
+    merged with finite ranges and are always emitted once per path.
+    A negative ``max_gap`` disables merging entirely, per the
+    reference-filesystem documentation.
     """
     # Check input
     if not isinstance(paths, list):
@@ -562,45 +567,70 @@ def merge_offset_ranges(
     if len(starts) <= 1:
         return paths, starts, ends
 
-    starts = [s or 0 for s in starts]
+    # Separate whole-file requests (start/end None); those cannot be
+    # merged with finite ranges, de-duplicated per path, but kept in
+    # their first-seen position relative to the other paths.
+    whole = {}
+    finite = []
+    for p, s, e in zip(paths, starts, ends):
+        if s is None or e is None:
+            whole.setdefault(p, (p, None, None))
+        else:
+            finite.append((p, s, e))
+
+    if not finite:
+        return [v[0] for v in whole.values()], [None] * len(whole), [None] * len(
+            whole
+        )
+
+    paths_f, starts_f, ends_f = (list(v) for v in zip(*finite))
+
     # Sort by paths and then ranges if `sort=True`
     if sort:
-        paths, starts, ends = (
+        paths_f, starts_f, ends_f = (
             list(v)
             for v in zip(
                 *sorted(
-                    zip(paths, starts, ends),
+                    zip(paths_f, starts_f, ends_f),
                 )
             )
         )
 
-    if paths:
-        # Loop through the coupled `paths`, `starts`, and
-        # `ends`, and merge adjacent blocks when appropriate
-        new_paths = paths[:1]
-        new_starts = starts[:1]
-        new_ends = ends[:1]
-        for i in range(1, len(paths)):
-            if paths[i] == paths[i - 1] and new_ends[-1] is None:
-                continue
-            elif (
-                paths[i] != paths[i - 1]
-                or ((starts[i] - new_ends[-1]) > max_gap)
-                or (max_block is not None and (ends[i] - new_starts[-1]) > max_block)
-            ):
-                # Cannot merge with previous block.
-                # Add new `paths`, `starts`, and `ends` elements
-                new_paths.append(paths[i])
-                new_starts.append(starts[i])
-                new_ends.append(ends[i])
-            else:
-                # Merge with previous block by updating the
-                # last element of `ends`
-                new_ends[-1] = ends[i]
-        return new_paths, new_starts, new_ends
+    new_paths = paths_f[:1]
+    new_starts = starts_f[:1]
+    new_ends = ends_f[:1]
+    for i in range(1, len(paths_f)):
+        if (
+            max_gap < 0
+            or paths_f[i] != paths_f[i - 1]
+            or (starts_f[i] - new_ends[-1]) > max_gap
+            or (
+                max_block is not None
+                and (ends_f[i] - new_starts[-1]) > max_block
+            )
+        ):
+            # Cannot merge with previous block. Add a new range.
+            new_paths.append(paths_f[i])
+            new_starts.append(starts_f[i])
+            new_ends.append(ends_f[i])
+        else:
+            # Merge with the previous block. Only extend the outer
+            # extent; nested/overlapping ranges must never shrink an
+            # already-merged interval.
+            if ends_f[i] > new_ends[-1]:
+                new_ends[-1] = ends_f[i]
+            # keep the earliest start in case of unsorted overlap
+            if starts_f[i] < new_starts[-1]:
+                new_starts[-1] = starts_f[i]
 
-    # `paths` is empty. Just return input lists
-    return paths, starts, ends
+    # Re-insert whole-file entries (de-duplicated), keeping deterministic
+    # ordering by path for callers that rely on sorted output.
+    whole_entries = sorted(whole.values(), key=lambda v: v[0])
+    merged = list(zip(new_paths, new_starts, new_ends))
+    out = whole_entries + merged
+    if sort:
+        out = sorted(out, key=lambda v: (v[0], v[1] is not None, v[1] or 0))
+    return [v[0] for v in out], [v[1] for v in out], [v[2] for v in out]
 
 
 def file_size(filelike: IO[bytes]) -> int:

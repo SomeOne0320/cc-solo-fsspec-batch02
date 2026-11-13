@@ -18,11 +18,12 @@ except ImportError:
     if not TYPE_CHECKING:
         import json
 
-from fsspec.asyn import AsyncFileSystem
+from fsspec.asyn import AsyncFileSystem, _run_coros_in_chunks
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.core import filesystem, open, split_protocol
 from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
 from fsspec.utils import (
+    is_exception,
     isfilelike,
     merge_offset_ranges,
     other_paths,
@@ -732,43 +733,45 @@ class ReferenceFileSystem(AsyncFileSystem):
             }
             if None not in self.fss:
                 self.fss[None] = filesystem("file")
-            return
-        if fs is not None:
+        elif fs is not None:
             # single remote FS
             remote_protocol = (
                 fs.protocol[0] if isinstance(fs.protocol, tuple) else fs.protocol
             )
             self.fss[remote_protocol] = fs
 
-        if remote_protocol is None:
-            # get single protocol from any templates
-            for ref in self.templates.values():
-                if callable(ref):
-                    ref = ref()
-                protocol, _ = fsspec.core.split_protocol(ref)
-                if protocol and protocol not in self.fss:
-                    fs = filesystem(protocol, **(remote_options or {}))
-                    self.fss[protocol] = fs
-        if remote_protocol is None:
-            # get single protocol from references
-            # TODO: warning here, since this can be very expensive?
-            for ref in self.references.values():
-                if callable(ref):
-                    ref = ref()
-                if isinstance(ref, list) and ref[0]:
-                    protocol, _ = fsspec.core.split_protocol(ref[0])
-                    if protocol not in self.fss:
+        if not isinstance(fs, dict):
+            if remote_protocol is None:
+                # get single protocol from any templates
+                for ref in self.templates.values():
+                    if callable(ref):
+                        ref = ref()
+                    protocol, _ = fsspec.core.split_protocol(ref)
+                    if protocol and protocol not in self.fss:
                         fs = filesystem(protocol, **(remote_options or {}))
                         self.fss[protocol] = fs
-                        # only use first remote URL
-                        break
+            if remote_protocol is None:
+                # get single protocol from references
+                # TODO: warning here, since this can be very expensive?
+                for ref in self.references.values():
+                    if callable(ref):
+                        ref = ref()
+                    if isinstance(ref, list) and ref[0]:
+                        protocol, _ = fsspec.core.split_protocol(ref[0])
+                        if protocol not in self.fss:
+                            fs = filesystem(protocol, **(remote_options or {}))
+                            self.fss[protocol] = fs
+                            # only use first remote URL
+                            break
 
-        if remote_protocol and remote_protocol not in self.fss:
-            fs = filesystem(remote_protocol, **(remote_options or {}))
-            self.fss[remote_protocol] = fs
+            if remote_protocol and remote_protocol not in self.fss:
+                fs = filesystem(remote_protocol, **(remote_options or {}))
+                self.fss[remote_protocol] = fs
 
-        self.fss[None] = fs or filesystem("file")  # default one
-        # Wrap any non-async filesystems to ensure async methods are available below
+            self.fss[None] = fs or filesystem("file")  # default one
+        # Wrap any non-async filesystems (including instances handed in via
+        # an ``fs={protocol: instance}`` mapping) to ensure async methods are
+        # available below. The borrowed backend objects are not closed here.
         for k, f in self.fss.items():
             if not f.async_impl:
                 self.fss[k] = AsyncFileSystemWrapper(f, asynchronous=self.asynchronous)
@@ -798,26 +801,23 @@ class ReferenceFileSystem(AsyncFileSystem):
         if len(part) == 1:
             logger.debug(f"Reference: {path}, whole file => {part}")
             url = part[0]
+            # whole-file references keep the ordinary backend range
+            # semantics, including None and negative boundaries
             start1, end1 = start, end
         else:
             url, start0, size = part
             logger.debug(f"Reference: {path} => {url}, offset {start0}, size {size}")
-            end0 = start0 + size
-
-            if start is not None:
-                if start >= 0:
-                    start1 = start0 + start
-                else:
-                    start1 = end0 + start
-            else:
-                start1 = start0
-            if end is not None:
-                if end >= 0:
-                    end1 = start0 + end
-                else:
-                    end1 = end0 + end
-            else:
-                end1 = end0
+            # The logical length is the *declared* size. Normalise the
+            # user's logical slice first, then map the surviving logical
+            # coordinates onto the physical offset. Out-of-range, empty
+            # and reversed slices therefore can never read bytes of a
+            # neighbouring logical file.
+            log_start, log_end, _ = slice(start, end).indices(size)
+            if log_start >= log_end:
+                # empty/reversed range: no physical read at all
+                return b"", None, None
+            start1 = start0 + log_start
+            end1 = start0 + log_end
         if url is None:
             url = self.target
         return url, start1, end1
@@ -843,6 +843,76 @@ class ReferenceFileSystem(AsyncFileSystem):
             return self.fss[protocol].cat_file(part_or_url, start=start0, end=end0)
         except Exception as e:
             raise ReferenceNotReachable(path, part_or_url) from e
+
+    async def _cat_ranges(
+        self,
+        paths,
+        starts,
+        ends,
+        max_gap=None,
+        batch_size=None,
+        on_error="return",
+        **kwargs,
+    ):
+        """Fetch logical byte ranges, returning a position-aligned list.
+
+        Each entry of the result corresponds to the matching entry of the
+        input lists; repeated logical paths and unordered ranges are kept.
+        ``on_error="return"`` places the exception at the failing position,
+        ``on_error="raise"`` raises the first actual failure; this list
+        interface intentionally has no "omit" behaviour.
+        """
+        if not isinstance(paths, list):
+            raise TypeError
+        if not isinstance(starts, list):
+            starts = [starts] * len(paths)
+        if not isinstance(ends, list):
+            ends = [ends] * len(paths)
+        if len(starts) != len(paths) or len(ends) != len(paths):
+            raise ValueError
+
+        # Resolve every logical reference up front so that a missing key
+        # raises FileNotFoundError before any backend work is scheduled.
+        jobs = []  # (index, url-or-bytes, phys_start, phys_end, path)
+        for idx, (p, s, e) in enumerate(zip(paths, starts, ends)):
+            url, ps, pe = self._cat_common(p, start=s, end=e)
+            jobs.append((idx, url, ps, pe, p))
+
+        pending = [
+            job for job in jobs if not isinstance(job[1], bytes)
+        ]
+        coros = [
+            self.fss[split_protocol(url)[0]]._cat_file(
+                url, start=ps, end=pe, **kwargs
+            )
+            for _, url, ps, pe, _ in pending
+        ]
+        fetched = await _run_coros_in_chunks(
+            coros,
+            batch_size=batch_size or self.batch_size,
+            nofiles=True,
+            return_exceptions=True,
+        )
+
+        out = [None] * len(paths)
+        for idx, url, _ps, _pe, _p in jobs:
+            if isinstance(url, bytes):
+                # inline data or an empty logical range; keep the same
+                # slicing behaviour as _cat_file
+                out[idx] = url[starts[idx] : ends[idx]]
+        for (idx, url, _ps, _pe, p), result in zip(pending, fetched):
+            if isinstance(result, Exception):
+                err = ReferenceNotReachable(p, url)
+                err.__cause__ = result
+                out[idx] = err
+            else:
+                out[idx] = result
+
+        if on_error == "raise":
+            ex = next(filter(is_exception, out), False)
+            if ex:
+                raise ex
+        return out
 
     def pipe_file(self, path, value, **_):
         """Temporarily add binary data or reference as a file"""
@@ -888,93 +958,124 @@ class ReferenceFileSystem(AsyncFileSystem):
         if isinstance(path, list) and (recursive or any("*" in p for p in path)):
             raise NotImplementedError
         # TODO: if references is lazy, pre-fetch all paths in batch before access
+        user_start = kwargs.pop("start", None)
+        user_end = kwargs.pop("end", None)
         proto_dict = _protocol_groups(path, self.references)
         out = {}
         for proto, paths in proto_dict.items():
             fs = self.fss[proto]
-            urls, starts, ends, valid_paths = [], [], [], []
+            # Resolve every logical reference in this protocol group into
+            # either inline bytes or a physical (url, start, end) job. The
+            # user's logical start/end are normalised inside _cat_common.
+            url_jobs = []  # (logical_path, url, phys_start, phys_end)
             for p in paths:
-                # find references or label not-found. Early exit if any not
-                # found and on_error is "raise"
                 try:
-                    u, s, e = self._cat_common(p)
-                    if not isinstance(u, (bytes, str)):
-                        # nan/None from parquet
-                        continue
+                    u, s, e = self._cat_common(
+                        p, start=user_start, end=user_end
+                    )
                 except FileNotFoundError as err:
                     if on_error == "raise":
                         raise
                     if on_error != "omit":
                         out[p] = err
-                else:
-                    urls.append(u)
-                    starts.append(s)
-                    ends.append(e)
-                    valid_paths.append(p)
-
-            # process references into form for merging
-            urls2 = []
-            starts2 = []
-            ends2 = []
-            paths2 = []
-            whole_files = set()
-            for u, s, e, p in zip(urls, starts, ends, valid_paths):
+                    continue
                 if isinstance(u, bytes):
-                    # data
-                    out[p] = u
-                elif s is None:
-                    # whole file - limits are None, None, but no further
-                    # entries take for this file
-                    whole_files.add(u)
-                    urls2.append(u)
-                    starts2.append(s)
-                    ends2.append(e)
-                    paths2.append(p)
-            for u, s, e, p in zip(urls, starts, ends, valid_paths):
-                # second run to account for files that are to be loaded whole
-                if s is not None and u not in whole_files:
-                    urls2.append(u)
-                    starts2.append(s)
-                    ends2.append(e)
-                    paths2.append(p)
+                    # inline data (or an empty logical finite range, which
+                    # _cat_common renders as b""); keep the existing inline
+                    # decode/slice behaviour
+                    out[p] = u[user_start:user_end]
+                elif not isinstance(u, str):
+                    # nan/None from parquet: no usable target
+                    continue
+                else:
+                    url_jobs.append((p, u, s, e))
 
-            # merge and fetch consolidated ranges
+            if not url_jobs:
+                continue
+
+            req_paths = [u for _, u, _, _ in url_jobs]
+            req_starts = [s for _, _, s, _ in url_jobs]
+            req_ends = [e for _, _, _, e in url_jobs]
+            # Merge overlapping/adjacent physical ranges per URL; whole-file
+            # requests pass through de-duplicated.
             new_paths, new_starts, new_ends = merge_offset_ranges(
-                list(urls2),
-                list(starts2),
-                list(ends2),
+                req_paths,
+                req_starts,
+                req_ends,
                 sort=True,
                 max_gap=self.max_gap,
                 max_block=self.max_block,
             )
-            bytes_out = fs.cat_ranges(new_paths, new_starts, new_ends)
+            bytes_out = fs.cat_ranges(
+                new_paths, new_starts, new_ends, **kwargs
+            )
 
-            # unbundle from merged bytes - simple approach
-            for u, s, e, p in zip(urls, starts, ends, valid_paths):
-                if p in out:
-                    continue  # was bytes, already handled
-                for np, ns, ne, b in zip(new_paths, new_starts, new_ends, bytes_out):
-                    if np == u and (ns is None or ne is None):
-                        if isinstance(b, Exception):
-                            out[p] = b
-                        else:
-                            out[p] = b[s:e]
-                    elif np == u and s >= ns and e <= ne:
-                        if isinstance(b, Exception):
-                            out[p] = b
-                        else:
-                            out[p] = b[s - ns : (e - ne) or None]
+            # Index the consolidated responses per URL so that each logical
+            # reference is sliced out with its own forward-relative offsets.
+            by_url = {}
+            for np_, ns, ne, b in zip(new_paths, new_starts, new_ends, bytes_out):
+                by_url.setdefault(np_, []).append((ns, ne, b))
 
-        for k, v in out.copy().items():
-            # these were valid references, but fetch failed, so transform exc
-            if isinstance(v, Exception) and k in self.references:
-                ex = out[k]
-                new_ex = ReferenceNotReachable(k, self.references[k])
-                new_ex.__cause__ = ex
-                if on_error == "raise":
-                    raise new_ex
-                elif on_error != "omit":
-                    out[k] = new_ex
+            for p, u, s, e in url_jobs:
+                if s is None:
+                    # whole-file reference: merge_offset_ranges always emits
+                    # a de-duplicated whole-file entry for this URL, so the
+                    # matching response is the complete backend file.
+                    match = next(
+                        (
+                            c
+                            for c in by_url.get(u, ())
+                            if c[0] is None or c[1] is None
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        err = ReferenceNotReachable(p, u)
+                        if on_error == "raise":
+                            raise err
+                        if on_error != "omit":
+                            out[p] = err
+                        continue
+                    _ns, _ne, b = match
+                else:
+                    # finite reference: pick the merged range covering the
+                    # requested physical interval. Merged intervals on one
+                    # URL are disjoint and sorted.
+                    match = next(
+                        (
+                            c
+                            for c in by_url.get(u, ())
+                            if c[0] is not None and c[0] <= s and e <= c[1]
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        err = ReferenceNotReachable(p, u)
+                        if on_error == "raise":
+                            raise err
+                        if on_error != "omit":
+                            out[p] = err
+                        continue
+                    ns, _ne, b = match
+                if isinstance(b, Exception):
+                    # preserve the failing logical key and actual target
+                    err = ReferenceNotReachable(p, u)
+                    err.__cause__ = b
+                    if on_error == "raise":
+                        raise err
+                    if on_error == "omit":
+                        continue
+                    out[p] = err
+                elif s is None:
+                    # whole-file reference keeps ordinary backend range
+                    # semantics for the user's boundaries
+                    out[p] = b[user_start:user_end]
+                else:
+                    # Slice with forward-relative coordinates against the
+                    # requested physical interval. A physical EOF short read
+                    # only shortens the available prefix; the declared
+                    # reference size is never assumed.
+                    out[p] = b[s - ns : (e - ns)]
 
         if len(out) == 1 and isinstance(path, str) and "*" not in path:
             return _first(out)

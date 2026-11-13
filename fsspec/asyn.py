@@ -253,21 +253,44 @@ async def _run_coros_in_chunks(
     n = len(coros)
     results = [None] * n
     pending = set()
+    done = set()
+    # Tasks/coroutines in `pending`, `done` and `coros[i:]` are owned by
+    # this invocation: if we leave via cancellation or a non-returned
+    # exception, cancel-and-drain the started tasks and close the
+    # coroutines that were never scheduled, so nothing keeps running in
+    # the background or produces "coroutine was never awaited" /
+    # "Task exception was never retrieved" warnings.
+    try:
+        while pending or i < n:
+            while len(pending) < batch_size and i < n:
+                pending.add(asyncio.ensure_future(_run_coro(coros[i], i)))
+                i += 1
 
-    while pending or i < n:
-        while len(pending) < batch_size and i < n:
-            pending.add(asyncio.ensure_future(_run_coro(coros[i], i)))
-            i += 1
+            if not pending:
+                break
 
-        if not pending:
-            break
-
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        while done:
-            result, k = await done.pop()
-            results[k] = result
-
-    return results
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            while done:
+                task = done.pop()
+                result, k = await task
+                results[k] = result
+        return results
+    except BaseException:
+        # Drain any finished tasks (including ones not popped before the
+        # failure) so their exceptions are retrieved, then cancel and
+        # drain the still-running ones.
+        for task in done:
+            task.exception()
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # coros[i:] were turned into neither tasks nor awaited results
+        for coro in coros[i:]:
+            coro.close()
+        raise
 
 
 # these methods should be implemented as async by any async-able backend
@@ -495,7 +518,6 @@ class AsyncFileSystem(AbstractFileSystem):
             Bytes limits of the read. If using a single int, the same value will be
             used to read all the specified files.
         """
-        # TODO: on_error
         if max_gap is not None:
             # use utils.merge_offset_ranges
             raise NotImplementedError
@@ -512,9 +534,16 @@ class AsyncFileSystem(AbstractFileSystem):
             for p, s, e in zip(paths, starts, ends)
         ]
         batch_size = batch_size or self.batch_size
-        return await _run_coros_in_chunks(
+        out = await _run_coros_in_chunks(
             coros, batch_size=batch_size, nofiles=True, return_exceptions=True
         )
+        if on_error == "raise":
+            ex = next(filter(is_exception, out), False)
+            if ex:
+                raise ex
+        # "return" (the default) keeps one bytes-or-exception value per
+        # input position; this list-style API has no "omit" semantics.
+        return out
 
     async def _put_file(self, lpath, rpath, mode="overwrite", **kwargs):
         raise NotImplementedError

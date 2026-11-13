@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 
@@ -5,6 +6,7 @@ import pytest
 
 import fsspec
 from fsspec.implementations.local import LocalFileSystem
+from fsspec.implementations.memory import MemoryFileSystem
 from fsspec.implementations.reference import (
     LazyReferenceMapper,
     ReferenceFileSystem,
@@ -508,11 +510,13 @@ def test_fss_has_defaults(m):
     assert fs.fss[None].sync_fs is m
 
     fs = fsspec.filesystem("reference", fs={"memory": m}, fo={})
-    assert fs.fss["memory"] is m
+    # sync backends handed in via an fs mapping are wrapped so that the
+    # async read path is available, just like a single sync fs
+    assert fs.fss["memory"].sync_fs is m
     assert fs.fss[None].protocol == ("file", "local")
 
     fs = fsspec.filesystem("reference", fs={None: m}, fo={})
-    assert fs.fss[None] is m
+    assert fs.fss[None].sync_fs is m
 
     fs = fsspec.filesystem("reference", fo={"key": ["memory://a"]})
     assert fs.fss[None] == fs.fss["memory"]
@@ -961,3 +965,406 @@ def test_parquet_no_references(m):
     lz.flush()
 
     assert arr[...].tolist() == 1  #  scalar, equal to fill value
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for logical ranges, merged reads, error and cancellation
+# lifecycle of the reference read pipeline.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def physical_file(tmp_path):
+    path = tmp_path / "physical"
+    path.write_bytes(b"0123456789ABCDE")
+    return str(path)
+
+
+class _CountingMemoryFS(MemoryFileSystem):
+    """Memory FS recording the consolidated ranges handed to cat_ranges."""
+
+    protocol = "memory"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.range_calls = []
+        self.physical_reads = 0
+
+    def cat_ranges(self, paths, starts, ends, max_gap=None, on_error="return", **kw):
+        self.range_calls.append((list(paths), list(starts), list(ends)))
+        return super().cat_ranges(paths, starts, ends, on_error=on_error, **kw)
+
+    def cat_file(self, path, start=None, end=None, **kwargs):
+        self.physical_reads += 1
+        return super().cat_file(path, start, end, **kwargs)
+
+
+class _RecordingAsyncFS(fsspec.asyn.AsyncFileSystem):
+    """Truly async, cancellable backend recording active/peak requests."""
+
+    protocol = "rec"
+    cachable = False
+
+    def __init__(self, fail_paths=(), **kwargs):
+        super().__init__(asynchronous=True, **kwargs)
+        self.active = 0
+        self.peak = 0
+        self.started = 0
+        self._two_started = asyncio.Event()
+        self._blockers = {}
+        self.fail_paths = set(fail_paths)
+
+    async def _cat_file(self, path, start=None, end=None, **kwargs):
+        if path in self.fail_paths:
+            raise FileNotFoundError(path)
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        self.started += 1
+        if self.started >= 2:
+            self._two_started.set()
+        blocker = asyncio.Event()
+        self._blockers[path] = blocker
+        try:
+            await blocker.wait()  # only released by cancellation
+            return b"should-not-return"
+        except asyncio.CancelledError:
+            self.active -= 1
+            raise
+
+
+def test_nested_ranges_keep_outer_reference(physical_file):
+    # an outer range fully containing a later inner range must not disappear
+    fs = fsspec.filesystem(
+        "reference",
+        fo={"outer": [physical_file, 0, 10], "inner": [physical_file, 2, 2]},
+    )
+    out = fs.cat(["outer", "inner"])
+    assert out == {"outer": b"0123456789", "inner": b"23"}
+
+
+def test_eof_short_read_does_not_shift_other_reference(physical_file):
+    fs = fsspec.filesystem(
+        "reference",
+        fo={
+            "first": [physical_file, 0, 10],
+            "second": [physical_file, 10, 10],
+        },
+        max_gap=0,
+    )
+    out = fs.cat(["first", "second"])
+    # physical EOF shortens only the second reference's available prefix
+    assert out["first"] == b"0123456789"
+    assert out["second"] == b"ABCDE"
+
+
+def test_finite_reference_logical_range_clamped(physical_file):
+    fs = fsspec.filesystem("reference", fo={"chunk": [physical_file, 5, 3]})
+    assert fs.cat_file("chunk", start=0, end=10) == b"567"
+    assert fs.cat_file("chunk", start=-99, end=99) == b"567"
+    assert fs.cat_file("chunk", start=99, end=100) == b""
+    assert fs.cat_file("chunk", start=0, end=0) == b""
+    assert fs.cat_file("chunk", start=2, end=1) == b""  # reversed slice
+    assert fs.cat_file("chunk", start=-1, end=3) == b"7"
+    assert fs.cat_file("chunk", start=-2) == b"67"
+    # no read may leak bytes of the neighbouring logical region
+    assert fs.cat_file("chunk", start=0, end=99) == b"567"
+
+
+def test_whole_file_reference_keeps_backend_range_semantics(physical_file):
+    fs = fsspec.filesystem("reference", fo={"whole": [physical_file]})
+    assert fs.cat_file("whole") == b"0123456789ABCDE"
+    assert fs.cat_file("whole", start=2, end=5) == b"234"
+    assert fs.cat_file("whole", start=-3) == b"CDE"
+    assert fs.cat_file("whole", start=None, end=None) == b"0123456789ABCDE"
+
+
+def test_inline_and_base64_slicing():
+    fs = fsspec.filesystem(
+        "reference",
+        fo={"raw": b"0123456789", "b64": b"base64:aGVsbG8=", "s": "hello"},
+    )
+    assert fs.cat_file("raw", 2, 5) == b"234"
+    assert fs.cat_file("b64") == b"hello"
+    assert fs.cat_file("s") == b"hello"
+
+
+def test_whole_and_finite_references_share_one_fetch(physical_file):
+    fs = fsspec.filesystem(
+        "reference",
+        fo={
+            "w": [physical_file],
+            "r": [physical_file, 2, 4],
+            "r2": [physical_file, 10, 5],
+        },
+    )
+    out = fs.cat(["w", "r", "r2"])
+    assert out == {
+        "w": b"0123456789ABCDE",
+        "r": b"2345",
+        "r2": b"ABCDE",
+    }
+
+
+def test_duplicate_overlapping_and_short_ranges(physical_file):
+    fs = fsspec.filesystem(
+        "reference",
+        fo={
+            "a": [physical_file, 0, 5],
+            "a2": [physical_file, 0, 5],
+            "b": [physical_file, 3, 4],
+            "c": [physical_file, 12, 10],  # runs past physical EOF
+        },
+    )
+    out = fs.cat(["a", "a2", "b", "c"])
+    assert out["a"] == out["a2"] == b"01234"
+    assert out["b"] == b"3456"
+    assert out["c"] == b"CDE"  # only the available prefix
+
+
+def test_merge_request_ranges_and_disable_switch(m):
+    m.pipe("/x", bytes(range(100)))
+    fo = {"p": ["memory://x", 0, 10], "q": ["memory://x", 12, 10]}
+
+    counting = _CountingMemoryFS()
+    counting.pipe("/x", bytes(range(100)))
+    merged = ReferenceFileSystem(fo=fo, fs=counting)
+    out = merged.cat(["p", "q"])
+    assert out == {"p": bytes(range(10)), "q": bytes(range(12, 22))}
+    # default max_gap merges the adjacent ranges into a single request
+    last_call = counting.range_calls[-1]
+    assert last_call == (["memory://x"], [0], [22])
+
+    counting = _CountingMemoryFS()
+    counting.pipe("/x", bytes(range(100)))
+    unmerged = ReferenceFileSystem(fo=fo, fs=counting, max_gap=-1)
+    unmerged.cat(["p", "q"])
+    last_call = counting.range_calls[-1]
+    assert last_call == (
+        ["memory://x", "memory://x"],
+        [0, 12],
+        [10, 22],
+    )
+
+    counting = _CountingMemoryFS()
+    counting.pipe("/x", bytes(range(100)))
+    blocked = ReferenceFileSystem(
+        fo=fo, fs=counting, max_gap=64_000, max_block=15
+    )
+    blocked.cat(["p", "q"])
+    # merged span (22) exceeds max_block -> stays split
+    assert len(counting.range_calls[-1][0]) == 2
+
+
+def test_different_physical_urls_are_not_merged(m):
+    m.pipe("/x1", b"0123456789")
+    m.pipe("/x2", b"ABCDEFGHIJ")
+    fs = fsspec.filesystem(
+        "reference",
+        fo={
+            "p": ["memory://x1", 0, 5],
+            "q": ["memory://x2", 0, 5],
+        },
+    )
+    assert fs.cat(["p", "q"]) == {"p": b"01234", "q": b"ABCDE"}
+
+
+def test_cat_on_error_strategies():
+    fs = fsspec.filesystem(
+        "reference",
+        fo={"good": b"good", "bad": ["/a/missing/local/file", 0, 2]},
+    )
+    with pytest.raises(ReferenceNotReachable) as exc:
+        fs.cat(["good", "bad"])
+    assert exc.value.reference == "bad"
+    assert exc.value.target == "/a/missing/local/file"
+    assert exc.value.__cause__ is not None
+
+    returned = fs.cat(["good", "bad"], on_error="return")
+    assert returned["good"] == b"good"
+    assert isinstance(returned["bad"], ReferenceNotReachable)
+    assert returned["bad"].reference == "bad"
+
+    assert fs.cat(["good", "bad"], on_error="omit") == {"good": b"good"}
+
+    with pytest.raises(FileNotFoundError):
+        fs.cat(["missing-logical"])
+    returned = fs.cat(["missing-logical", "good"], on_error="return")
+    assert isinstance(returned["missing-logical"], FileNotFoundError)
+    assert returned["good"] == b"good"
+    assert fs.cat(["missing-logical", "good"], on_error="omit") == {
+        "good": b"good"
+    }
+
+
+def test_shared_backend_failure_attributes_each_reference():
+    fs = fsspec.filesystem(
+        "reference",
+        fo={
+            "r1": ["/a/missing/local/file", 0, 2],
+            "r2": ["/a/missing/local/file", 4, 2],
+            "ok": b"x",
+        },
+    )
+    out = fs.cat(["r1", "r2", "ok"], on_error="return")
+    assert out["ok"] == b"x"
+    assert isinstance(out["r1"], ReferenceNotReachable)
+    assert out["r1"].reference == "r1"
+    assert isinstance(out["r2"], ReferenceNotReachable)
+    assert out["r2"].reference == "r2"
+
+
+def test_sync_fs_dict_is_wrapped_for_async_reads(m):
+    m.pipe("/k", b"zzz")
+    local = LocalFileSystem()
+    fs = ReferenceFileSystem(
+        fo={"k": ["memory://k", 0, 3]},
+        fs={"memory": m, "file": local},
+    )
+    # instances in the fs dict get the same async adaptation as a single fs
+    assert fs.fss["memory"].sync_fs is m
+    assert asyncio.run(fs._cat_file("k")) == b"zzz"
+    # borrowing the backend does not close it
+    assert not getattr(local, "closed", False)
+
+
+def test_target_substitutes_none_url(physical_file):
+    fs = fsspec.filesystem(
+        "reference", fo={"x": [None, 0, 4]}, target=physical_file
+    )
+    assert fs.cat_file("x") == b"0123"
+
+
+@pytest.mark.asyncio
+async def test_async_cat_ranges_ordering_repeats_and_errors(m):
+    m.pipe("/mem", b"abcdefghij")
+    backend = fsspec.filesystem("memory", asynchronous=True)
+    fs = ReferenceFileSystem(
+        fo={
+            "a": ["memory://mem", 0, 3],
+            "b": ["memory://mem", 3, 3],
+            "bad": ["/a/missing/local/file", 0, 2],
+        },
+        fs=backend,
+        asynchronous=True,
+    )
+
+    out = await fs._cat_ranges(["b", "a", "b", "a"], [0] * 4, [3] * 4)
+    assert out == [b"def", b"abc", b"def", b"abc"]
+
+    out = await fs._cat_ranges(
+        ["a", "bad", "a"], [0, 0, 0], [3, 2, 3], on_error="return"
+    )
+    assert out[0] == b"abc" and out[2] == b"abc"
+    assert isinstance(out[1], ReferenceNotReachable)
+    assert out[1].reference == "bad"
+
+    with pytest.raises(ReferenceNotReachable):
+        await fs._cat_ranges(["a", "bad"], [0, 0], [3, 2], on_error="raise")
+
+    # scalar broadcast and length checks
+    out = await fs._cat_ranges(["a", "b"], 0, 3)
+    assert out == [b"abc", b"def"]
+    with pytest.raises(ValueError):
+        await fs._cat_ranges(["a", "b"], [0], [3, 3])
+    with pytest.raises(TypeError):
+        await fs._cat_ranges("a", 0, 3)
+
+
+@pytest.mark.asyncio
+async def test_async_cat_ranges_inline_and_empty_slices(m):
+    backend = fsspec.filesystem("memory", asynchronous=True)
+    fs = ReferenceFileSystem(
+        fo={"raw": b"0123456789", "r": ["memory://nope", 0, 4]},
+        fs=backend,
+        asynchronous=True,
+    )
+    out = await fs._cat_ranges(["raw", "raw"], [0, 2], [3, 5])
+    assert out == [b"012", b"234"]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drains_owned_tasks_only():
+    backend = _RecordingAsyncFS()
+    fs = ReferenceFileSystem(
+        fo={f"k{i}": [f"rec://f{i}", 0, 3] for i in range(3)},
+        fs=backend,
+        asynchronous=True,
+    )
+    outer = asyncio.ensure_future(
+        fs._cat_ranges(
+            [f"k{i}" for i in range(3)],
+            [0, 0, 0],
+            [3, 3, 3],
+            batch_size=2,
+        )
+    )
+    # wait until exactly batch_size reads are running
+    await backend._two_started.wait()
+    assert backend.active == 2
+    assert backend.peak <= 2
+
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    # let the cancel-and-drain settle
+    await asyncio.sleep(0.05)
+    assert backend.active == 0
+    assert backend.started == 2  # third coroutine never scheduled
+
+    # unrelated work on the same loop is untouched
+    async def independent():
+        await asyncio.sleep(0)
+        return "alive"
+
+    assert await independent() == "alive"
+
+
+@pytest.mark.asyncio
+async def test_run_coros_in_chunks_cancel_closes_unscheduled():
+    from fsspec.asyn import _run_coros_in_chunks
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocker():
+        started.set()
+        await release.wait()
+        return "done"
+
+    async def never_scheduled():
+        return "nope"
+
+    task = asyncio.ensure_future(
+        _run_coros_in_chunks(
+            [blocker(), blocker(), never_scheduled()], batch_size=2
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # no "coroutine was never awaited" warning is emitted when the loop
+    # closes; the unscheduled coroutine was closed by the helper.
+
+
+def test_merge_offset_ranges_nested_and_disable():
+    from fsspec.utils import merge_offset_ranges
+
+    # nested interval must not shrink the merged block
+    p, s, e = merge_offset_ranges(
+        ["u", "u"], [0, 2], [10, 4], max_gap=0, max_block=None
+    )
+    assert (p, s, e) == (["u"], [0], [10])
+
+    # negative max_gap disables merging entirely
+    p, s, e = merge_offset_ranges(
+        ["u", "u"], [0, 2], [4, 6], max_gap=-1, max_block=None
+    )
+    assert (p, s, e) == (["u", "u"], [0, 2], [4, 6])
+
+    # whole-file entries pass through de-duplicated
+    p, s, e = merge_offset_ranges(
+        ["u", "u"], [None, None], [None, None], max_gap=0, max_block=None
+    )
+    assert (p, s, e) == (["u"], [None], [None])
